@@ -1,0 +1,45 @@
+# Configurazione di esempio: copiala in cloudraid.toml e adatta i percorsi.
+#
+# Ogni blocco di dati diventa data_shards + parity_shards frammenti, ognuno su un
+# backend diverso. Si possono perdere fino a parity_shards backend senza perdere dati.
+# Spazio occupato: (data_shards + parity_shards) / data_shards volte i dati (qui 1,5x).
+data_shards = 4
+parity_shards = 2
+
+# Dimensioni dei blocchi (facoltativo, valori predefiniti: 1, 4 e 16 MiB).
+# [chunk]
+# min = 1048576
+# avg = 4194304
+# max = 16777216
+
+# Servono almeno data_shards + parity_shards backend. Con uno in più, `scrub --repair`
+# può spostare i frammenti di un account perso anche senza sostituirlo.
+[[backend]]
+name = "account1"
+type = "local"
+path = "/srv/cloudraid/account1"
+
+[[backend]]
+name = "account2"
+type = "local"
+path = "/srv/cloudraid/account2"
+
+[[backend]]
+name = "account3"
+type = "local"
+path = "/srv/cloudraid/account3"
+
+[[backend]]
+name = "account4"
+type = "local"
+path = "/srv/cloudraid/account4"
+
+[[backend]]
+name = "account5"
+type = "local"
+path = "/srv/cloudraid/account5"
+
+[[backend]]
+name = "account6"
+type = "local"
+path = "/srv/cloudraid/account6"
