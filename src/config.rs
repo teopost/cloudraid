@@ -14,6 +14,11 @@ pub struct Config {
     pub parity_shards: usize,
     #[serde(default)]
     pub chunk: ChunkConfig,
+    /// Blocchi caricati o scaricati in parallelo (ognuno con tutti i suoi frammenti in parallelo).
+    #[serde(default = "default_transfers")]
+    pub transfers: usize,
+    #[serde(default)]
+    pub rclone: RcloneConfig,
     #[serde(rename = "backend")]
     pub backends: Vec<BackendConfig>,
 }
@@ -33,6 +38,35 @@ impl Default for ChunkConfig {
     }
 }
 
+fn default_transfers() -> usize {
+    4
+}
+
+/// Come avviare rclone, usato dai backend di tipo `rclone`.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct RcloneConfig {
+    /// Eseguibile di rclone.
+    #[serde(default = "default_rclone")]
+    pub binary: String,
+    /// File di configurazione di rclone (predefinito: quello di rclone, ~/.config/rclone/rclone.conf).
+    #[serde(default)]
+    pub config: Option<PathBuf>,
+    /// Opzioni aggiuntive per `rclone rcd`, per esempio `["--tpslimit", "10"]`.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+fn default_rclone() -> String {
+    "rclone".into()
+}
+
+impl Default for RcloneConfig {
+    fn default() -> Self {
+        RcloneConfig { binary: default_rclone(), config: None, args: Vec::new() }
+    }
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct BackendConfig {
     pub name: String,
@@ -45,6 +79,9 @@ pub struct BackendConfig {
 pub enum BackendKind {
     /// Una cartella locale (o un disco montato).
     Local { path: PathBuf },
+    /// Un remote di rclone con il suo percorso, per esempio `gdrive:cloudraid`:
+    /// Google Drive, OneDrive, Dropbox, MEGA, pCloud, SFTP, WebDAV, S3…
+    Rclone { remote: String },
 }
 
 impl Config {
@@ -78,6 +115,9 @@ impl Config {
                 self.backends.len()
             );
         }
+        if !(1..=64).contains(&self.transfers) {
+            bail!("transfers deve essere fra 1 e 64");
+        }
         let mut names = HashSet::new();
         for b in &self.backends {
             if b.name.is_empty() {
@@ -85,6 +125,11 @@ impl Config {
             }
             if !names.insert(b.name.as_str()) {
                 bail!("nome di backend ripetuto: {}", b.name);
+            }
+            if let BackendKind::Rclone { remote } = &b.kind {
+                if remote.trim().is_empty() {
+                    bail!("backend {}: remote vuoto", b.name);
+                }
             }
         }
         let c = self.chunk;

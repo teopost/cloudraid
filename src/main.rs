@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use cloudraid::repo::LOCK_STALE_SECS;
 use cloudraid::{Config, ReadStats, Repo};
 
 #[derive(Parser)]
@@ -48,6 +49,12 @@ enum Cmd {
         /// Ricostruisce i frammenti mancanti o danneggiati
         #[arg(long)]
         repair: bool,
+    },
+    /// Cancella i lock lasciati da processi interrotti
+    Unlock {
+        /// Cancella anche i lock non ancora scaduti (solo se sei sicuro che nessun processo stia lavorando)
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -167,13 +174,23 @@ fn cmd_status(repo: &Repo, cfg: &Config) {
     );
     for b in repo.status() {
         println!(
-            "  {:<16} {:<15} {:>8} frammenti  {:>10}",
+            "  {:<12} {:<15} {:>8} frammenti {:>10}  {}",
             b.name,
             if b.available { "disponibile" } else { "NON DISPONIBILE" },
             b.shards,
-            human(b.bytes)
+            human(b.bytes),
+            b.location
         );
     }
+    for l in repo.locks() {
+        let age = now().saturating_sub(l.time);
+        let state = if age >= LOCK_STALE_SECS { "scaduto" } else { "attivo" };
+        println!("lock {state}: {} pid {}, rinnovato {age} s fa", l.host, l.pid);
+    }
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -185,6 +202,10 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let mut repo = Repo::open(cfg.clone(), &password(false)?)?;
+    // chi modifica il repository prende il lock esclusivo
+    if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true }) {
+        repo.lock()?;
+    }
     let result = match cli.cmd {
         Cmd::Init => unreachable!(),
         Cmd::Put { src, dest } => cmd_put(&mut repo, &src, dest),
@@ -210,6 +231,18 @@ fn run(cli: Cli) -> Result<()> {
         },
         Cmd::Status => {
             cmd_status(&repo, &cfg);
+            Ok(())
+        }
+        Cmd::Unlock { all } => {
+            let removed = repo.break_locks(all);
+            for l in &removed {
+                println!("lock cancellato: {} pid {}", l.host, l.pid);
+            }
+            let left = repo.locks().len();
+            println!("{} lock cancellati, {} rimasti", removed.len(), left);
+            if left > 0 {
+                println!("i lock rimasti sono attivi (rinnovati negli ultimi {} minuti): usa --all solo se sei sicuro", LOCK_STALE_SECS / 60);
+            }
             Ok(())
         }
         Cmd::Scrub { repair } => repo.scrub(repair).and_then(|r| {

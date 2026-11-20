@@ -2,23 +2,31 @@
 //!
 //! Percorso di un file in scrittura: blocchi a lunghezza variabile (FastCDC) → deduplicazione
 //! → cifratura → Reed-Solomon (k + m frammenti) → ogni frammento su un backend diverso.
+//! Più blocchi viaggiano insieme (`transfers`) e i frammenti di un blocco vanno in parallelo.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::{self, Backend};
 use crate::config::Config;
-use crate::crypto::{self, KeyFile, Keys};
+use crate::crypto::{self, random_hex, KeyFile, Keys};
 use crate::erasure;
 use crate::index::{ChunkEntry, FileEntry, Index, ShardLoc};
 
 const KEYFILE: &str = "cloudraid.key";
 const INDEX_DIR: &str = "index";
+const LOCK_DIR: &str = "locks";
 /// Generazioni dell'indice tenute su ogni backend.
 const KEEP_INDEXES: usize = 3;
+/// Un lock non rinnovato da così tanto appartiene a un processo morto.
+pub const LOCK_STALE_SECS: u64 = 30 * 60;
+const LOCK_REFRESH_SECS: u64 = 5 * 60;
 
 pub struct Repo {
     cfg: Config,
@@ -29,6 +37,8 @@ pub struct Repo {
     /// Frammenti da cancellare dopo il prossimo salvataggio riuscito dell'indice:
     /// cancellarli prima lascerebbe l'indice vecchio con riferimenti a dati spariti.
     pending_deletes: Vec<(String, String)>,
+    /// Il lock che teniamo, e quando l'abbiamo rinnovato.
+    lock: Option<(LockInfo, u64)>,
 }
 
 /// Statistiche di lettura.
@@ -58,9 +68,20 @@ pub struct ScrubReport {
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
     pub name: String,
+    pub location: String,
     pub available: bool,
     pub shards: u64,
     pub bytes: u64,
+}
+
+/// Il contenuto di un file `locks/<id>.json`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct LockInfo {
+    pub id: String,
+    pub host: String,
+    pub pid: u32,
+    /// Unix time dell'ultimo rinnovo.
+    pub time: u64,
 }
 
 enum Shard {
@@ -81,6 +102,29 @@ fn parse_index_key(key: &str) -> Option<u64> {
     key.strip_prefix(INDEX_DIR)?.strip_prefix('/')?.strip_suffix(".bin")?.parse().ok()
 }
 
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "sconosciuto".into())
+}
+
+/// Esegue `f` su ogni elemento in parallelo, un thread per elemento, e restituisce i risultati in ordine.
+fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let f = &f;
+    thread::scope(|s| {
+        let handles: Vec<_> = items.iter().map(|it| s.spawn(move || f(it))).collect();
+        handles.into_iter().map(|h| h.join().expect("thread di lavoro interrotto")).collect()
+    })
+}
+
 /// Percorso dentro il repository: senza `/` iniziale, senza `.` né `..`.
 pub fn normalize(path: &str) -> Result<String> {
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty() && *p != ".").collect();
@@ -94,7 +138,7 @@ impl Repo {
     /// Crea un repository nuovo su tutti i backend della configurazione.
     pub fn init(cfg: Config, password: &str) -> Result<Repo> {
         cfg.validate()?;
-        let backends: Vec<_> = cfg.backends.iter().map(backend::open).collect();
+        let backends = backend::open_all(&cfg)?;
         for b in &backends {
             b.create()?;
             if b.get(KEYFILE)?.is_some() {
@@ -106,7 +150,15 @@ impl Repo {
         for b in &backends {
             b.put(KEYFILE, &json)?;
         }
-        let mut repo = Repo { cfg, backends, keys, index: Index::default(), dirty: true, pending_deletes: Vec::new() };
+        let mut repo = Repo {
+            cfg,
+            backends,
+            keys,
+            index: Index::default(),
+            dirty: true,
+            pending_deletes: Vec::new(),
+            lock: None,
+        };
         repo.save()?;
         Ok(repo)
     }
@@ -114,8 +166,10 @@ impl Repo {
     /// Apre un repository esistente: basta un backend con la chiave e l'indice.
     pub fn open(cfg: Config, password: &str) -> Result<Repo> {
         cfg.validate()?;
-        let backends: Vec<_> = cfg.backends.iter().map(backend::open).collect();
-        if !backends.iter().any(|b| b.is_available()) {
+        let backends = backend::open_all(&cfg)?;
+        // verifica la disponibilità di tutti i backend in parallelo (per rclone è una chiamata di rete)
+        let avail = parallel(&backends, |b| b.is_available());
+        if !avail.contains(&true) {
             bail!("nessun backend disponibile");
         }
 
@@ -134,14 +188,12 @@ impl Repo {
         })?;
 
         // l'indice più recente che si riesce a leggere, da qualsiasi backend
-        let mut candidates: Vec<(u64, usize, String)> = Vec::new();
-        for (i, b) in backends.iter().enumerate().filter(|(_, b)| b.is_available()) {
-            for key in b.list(INDEX_DIR).unwrap_or_default() {
-                if let Some(generation) = parse_index_key(&key) {
-                    candidates.push((generation, i, key));
-                }
-            }
-        }
+        let listed = parallel(&backends, |b| if b.is_available() { b.list(INDEX_DIR).unwrap_or_default() } else { Vec::new() });
+        let mut candidates: Vec<(u64, usize, String)> = listed
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, keys)| keys.into_iter().filter_map(move |k| parse_index_key(&k).map(|g| (g, i, k))))
+            .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
         let index = candidates
             .iter()
@@ -153,7 +205,7 @@ impl Repo {
             })
             .ok_or_else(|| anyhow!("indice non trovato su nessun backend disponibile"))?;
 
-        Ok(Repo { cfg, backends, keys, index, dirty: false, pending_deletes: Vec::new() })
+        Ok(Repo { cfg, backends, keys, index, dirty: false, pending_deletes: Vec::new(), lock: None })
     }
 
     pub fn index(&self) -> &Index {
@@ -168,6 +220,128 @@ impl Repo {
         (0..self.backends.len()).filter(|&i| self.backends[i].is_available()).collect()
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Lock: un solo processo alla volta può modificare il repository.
+
+    fn read_locks(&self) -> Vec<LockInfo> {
+        let lists = parallel(&self.backends, |b| {
+            if !b.is_available() {
+                return Vec::new();
+            }
+            b.list(LOCK_DIR)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|k| b.get(k).ok().flatten())
+                .filter_map(|data| serde_json::from_slice::<LockInfo>(&data).ok())
+                .collect()
+        });
+        let mut by_id: BTreeMap<String, LockInfo> = BTreeMap::new();
+        for lock in lists.into_iter().flatten() {
+            match by_id.get(&lock.id) {
+                Some(old) if old.time >= lock.time => {}
+                _ => {
+                    by_id.insert(lock.id.clone(), lock);
+                }
+            }
+        }
+        by_id.into_values().collect()
+    }
+
+    /// I lock presenti sul repository (anche scaduti), il nostro escluso.
+    pub fn locks(&self) -> Vec<LockInfo> {
+        let mine = self.lock.as_ref().map(|(l, _)| l.id.clone());
+        self.read_locks().into_iter().filter(|l| Some(&l.id) != mine.as_ref()).collect()
+    }
+
+    fn write_lock(&self, lock: &LockInfo) -> Result<()> {
+        let data = serde_json::to_vec(lock)?;
+        let key = format!("{LOCK_DIR}/{}.json", lock.id);
+        let results = parallel(&self.backends, |b| if b.is_available() { Some(b.put(&key, &data)) } else { None });
+        let ok = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        if ok == 0 {
+            let errors: Vec<String> = results.into_iter().flatten().filter_map(|r| r.err()).map(|e| format!("{e:#}")).collect();
+            bail!("impossibile scrivere il lock: {}", errors.join("; "));
+        }
+        Ok(())
+    }
+
+    fn delete_lock(&self, id: &str) {
+        let key = format!("{LOCK_DIR}/{id}.json");
+        parallel(&self.backends, |b| {
+            if b.is_available() {
+                if let Err(e) = b.delete(&key) {
+                    eprintln!("attenzione: {e:#}");
+                }
+            }
+        });
+    }
+
+    /// Prende il lock esclusivo. Fallisce se un altro processo lo tiene (e non è scaduto).
+    pub fn lock(&mut self) -> Result<()> {
+        if self.lock.is_some() {
+            return Ok(());
+        }
+        let busy = |locks: Vec<LockInfo>, mine: &str| {
+            locks.into_iter().find(|l| l.id != mine && now().saturating_sub(l.time) < LOCK_STALE_SECS)
+        };
+        let describe = |l: &LockInfo| {
+            format!(
+                "repository in uso da {} (pid {}, lock rinnovato {} s fa). Se quel processo non esiste più: `cloudraid unlock`",
+                l.host,
+                l.pid,
+                now().saturating_sub(l.time)
+            )
+        };
+        if let Some(other) = busy(self.read_locks(), "") {
+            bail!("{}", describe(&other));
+        }
+        let mine = LockInfo { id: random_hex(8), host: hostname(), pid: std::process::id(), time: now() };
+        self.write_lock(&mine)?;
+        // un altro processo potrebbe aver scritto il suo lock nello stesso istante: si ricontrolla
+        if let Some(other) = busy(self.read_locks(), &mine.id) {
+            self.delete_lock(&mine.id);
+            bail!("{}", describe(&other));
+        }
+        let t = mine.time;
+        self.lock = Some((mine, t));
+        Ok(())
+    }
+
+    /// Rinnova il lock se è passato abbastanza tempo; chiamato durante le operazioni lunghe.
+    fn refresh_lock(&mut self) {
+        let Some((lock, refreshed)) = &self.lock else { return };
+        if now().saturating_sub(*refreshed) < LOCK_REFRESH_SECS {
+            return;
+        }
+        let mut lock = lock.clone();
+        lock.time = now();
+        match self.write_lock(&lock) {
+            Ok(()) => {
+                let t = lock.time;
+                self.lock = Some((lock, t));
+            }
+            Err(e) => eprintln!("attenzione: rinnovo del lock: {e:#}"),
+        }
+    }
+
+    pub fn unlock(&mut self) {
+        if let Some((lock, _)) = self.lock.take() {
+            self.delete_lock(&lock.id);
+        }
+    }
+
+    /// Cancella i lock degli altri processi: solo quelli scaduti, oppure tutti con `all`.
+    pub fn break_locks(&self, all: bool) -> Vec<LockInfo> {
+        let removed: Vec<LockInfo> =
+            self.locks().into_iter().filter(|l| all || now().saturating_sub(l.time) >= LOCK_STALE_SECS).collect();
+        for l in &removed {
+            self.delete_lock(&l.id);
+        }
+        removed
+    }
+
+    // -----------------------------------------------------------------------------------------
+
     /// Salva l'indice (nuova generazione) su tutti i backend disponibili, poi esegue
     /// le cancellazioni in sospeso.
     pub fn save(&mut self) -> Result<()> {
@@ -177,19 +351,18 @@ impl Repo {
         self.index.generation += 1;
         let sealed = self.keys.seal(&serde_json::to_vec(&self.index)?);
         let key = index_key(self.index.generation);
-        let mut saved = 0;
-        let mut errors = Vec::new();
-        for b in self.backends.iter().filter(|b| b.is_available()) {
-            match b.put(&key, &sealed) {
-                Ok(()) => {
-                    saved += 1;
-                    if let Err(e) = prune_indexes(b.as_ref()) {
-                        eprintln!("attenzione: {e:#}");
-                    }
-                }
-                Err(e) => errors.push(format!("{e:#}")),
+        let results = parallel(&self.backends, |b| {
+            if !b.is_available() {
+                return None;
             }
-        }
+            Some(b.put(&key, &sealed).map(|()| {
+                if let Err(e) = prune_indexes(b.as_ref()) {
+                    eprintln!("attenzione: {e:#}");
+                }
+            }))
+        });
+        let saved = results.iter().filter(|r| matches!(r, Some(Ok(())))).count();
+        let errors: Vec<String> = results.into_iter().flatten().filter_map(|r| r.err()).map(|e| format!("{e:#}")).collect();
         if saved == 0 {
             self.index.generation -= 1;
             bail!("impossibile salvare l'indice: {}", errors.join("; "));
@@ -198,13 +371,14 @@ impl Repo {
             eprintln!("attenzione: indice non salvato: {e}");
         }
         self.dirty = false;
-        for (name, key) in std::mem::take(&mut self.pending_deletes) {
-            if let Some(b) = self.backend(&name).filter(|b| b.is_available()) {
-                if let Err(e) = b.delete(&key) {
+        let deletes = std::mem::take(&mut self.pending_deletes);
+        parallel(&deletes, |(name, key)| {
+            if let Some(b) = self.backend(name).filter(|b| b.is_available()) {
+                if let Err(e) = b.delete(key) {
                     eprintln!("attenzione: {e:#}");
                 }
             }
-        }
+        });
         Ok(())
     }
 
@@ -222,34 +396,62 @@ impl Repo {
             .metadata()
             .ok()
             .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
 
         let c = self.cfg.chunk;
+        let mut cdc = fastcdc::v2020::StreamCDC::new(file, c.min, c.avg, c.max);
         let mut hasher = blake3::Hasher::new();
         let mut chunks: Vec<String> = Vec::new();
         let mut size = 0u64;
         let mut new_chunks = 0u64;
-        let result: Result<()> = (|| {
-            for chunk in fastcdc::v2020::StreamCDC::new(file, c.min, c.avg, c.max) {
+        let result: Result<()> = (|| loop {
+            // un gruppo di `transfers` blocchi alla volta
+            let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+            for chunk in cdc.by_ref().take(self.cfg.transfers) {
                 let chunk = chunk.map_err(|e| anyhow!("lettura di {}: {e}", src.display()))?;
                 hasher.update(&chunk.data);
                 size += chunk.length as u64;
-                let id = self.keys.chunk_id(&chunk.data);
-                if let Some(entry) = self.index.chunks.get_mut(&id) {
-                    entry.refs += 1;
-                } else {
-                    let entry = self.store_chunk(&id, &chunk.data)?;
-                    self.index.chunks.insert(id.clone(), entry);
-                    new_chunks += 1;
+                batch.push((self.keys.chunk_id(&chunk.data), chunk.data));
+            }
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let mut seen = HashSet::new();
+            let to_store: Vec<&(String, Vec<u8>)> =
+                batch.iter().filter(|(id, _)| !self.index.chunks.contains_key(id) && seen.insert(id.clone())).collect();
+            let stored = parallel(&to_store, |(id, data)| self.store_chunk(id, data));
+            let mut first_error = None;
+            for (item, res) in to_store.iter().zip(stored) {
+                match res {
+                    // refs a 0: li incrementa il ciclo qui sotto, o li libera la pulizia in caso di errore
+                    Ok(entry) => {
+                        self.index.chunks.insert(item.0.clone(), entry);
+                        new_chunks += 1;
+                    }
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
                 }
-                self.dirty = true;
+            }
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+            for (id, _) in batch {
+                self.index.chunks.get_mut(&id).expect("blocco appena salvato").refs += 1;
                 chunks.push(id);
             }
-            Ok(())
+            self.dirty = true;
+            self.refresh_lock();
         })();
         if let Err(e) = result {
-            self.release(&chunks); // annulla i riferimenti già presi
+            // annulla i riferimenti già presi e libera i blocchi scritti ma non usati
+            self.release(&chunks);
+            let orphans: Vec<String> =
+                self.index.chunks.iter().filter(|(_, c)| c.refs == 0).map(|(id, _)| id.clone()).collect();
+            for id in orphans {
+                self.forget_chunk(&id);
+            }
             return Err(e);
         }
 
@@ -261,49 +463,59 @@ impl Repo {
         Ok(new_chunks)
     }
 
-    /// Cifra un blocco, lo divide in k + m frammenti e li scrive su backend tutti diversi.
+    /// Cifra un blocco, lo divide in k + m frammenti e li scrive in parallelo su backend tutti diversi.
     fn store_chunk(&self, id: &str, plain: &[u8]) -> Result<ChunkEntry> {
         let (k, m) = (self.cfg.data_shards, self.cfg.parity_shards);
+        let n = k + m;
         let sealed = self.keys.seal(plain);
         let (shard_len, shards) = erasure::encode(&sealed, k, m)?;
 
         let avail = self.available();
-        if avail.len() < k + m {
+        if avail.len() < n {
             bail!(
-                "servono {} backend disponibili ({k} dati + {m} parità), ce ne sono {}: scrittura annullata",
-                k + m,
+                "servono {n} backend disponibili ({k} dati + {m} parità), ce ne sono {}: scrittura annullata",
                 avail.len()
             );
         }
         // si parte da un backend che dipende dall'id, così i frammenti di dati si distribuiscono
         let start = usize::from_str_radix(&id[..4], 16)? % avail.len();
         let order: Vec<usize> = (0..avail.len()).map(|j| avail[(start + j) % avail.len()]).collect();
-        let mut next = 0;
-        let mut written: Vec<(usize, String)> = Vec::new();
-        let mut locs = Vec::with_capacity(shards.len());
-        for (i, shard) in shards.iter().enumerate() {
-            let key = shard_key(id, i);
-            loop {
-                let Some(&bi) = order.get(next) else {
-                    for (bi, key) in &written {
-                        let _ = self.backends[*bi].delete(key);
+
+        let jobs: Vec<usize> = (0..n).collect();
+        let first = parallel(&jobs, |&i| self.backends[order[i]].put(&shard_key(id, i), &shards[i]));
+        let mut placed: Vec<Option<usize>> = vec![None; n];
+        for (i, res) in first.into_iter().enumerate() {
+            match res {
+                Ok(()) => placed[i] = Some(order[i]),
+                Err(e) => eprintln!("attenzione: {e:#}; provo un altro backend"),
+            }
+        }
+        // i frammenti falliti vanno sui backend di riserva, se ce ne sono
+        let mut spares = order[n..].iter().copied();
+        for i in 0..n {
+            while placed[i].is_none() {
+                let Some(bi) = spares.next() else {
+                    for (j, bi) in placed.iter().enumerate() {
+                        if let Some(bi) = bi {
+                            let _ = self.backends[*bi].delete(&shard_key(id, j));
+                        }
                     }
-                    bail!("impossibile scrivere il frammento {i} del blocco {}: troppi backend in errore", &id[..12]);
+                    bail!("impossibile scrivere il blocco {}: troppi backend in errore", &id[..12]);
                 };
-                next += 1;
-                match self.backends[bi].put(&key, shard) {
-                    Ok(()) => {
-                        written.push((bi, key.clone()));
-                        locs.push(ShardLoc {
-                            backend: self.backends[bi].name().to_string(),
-                            hash: blake3::hash(shard).to_hex().to_string(),
-                        });
-                        break;
-                    }
-                    Err(e) => eprintln!("attenzione: {e:#}; provo un altro backend"),
+                match self.backends[bi].put(&shard_key(id, i), &shards[i]) {
+                    Ok(()) => placed[i] = Some(bi),
+                    Err(e) => eprintln!("attenzione: {e:#}"),
                 }
             }
         }
+        let locs = placed
+            .iter()
+            .zip(&shards)
+            .map(|(bi, shard)| ShardLoc {
+                backend: self.backends[bi.expect("frammento piazzato")].name().to_string(),
+                hash: blake3::hash(shard).to_hex().to_string(),
+            })
+            .collect();
         Ok(ChunkEntry {
             plain_len: plain.len() as u64,
             sealed_len: sealed.len() as u64,
@@ -311,25 +523,27 @@ impl Repo {
             m: m as u8,
             shard_len: shard_len as u64,
             shards: locs,
-            refs: 1,
+            refs: 0,
         })
     }
 
-    /// Toglie un riferimento a ogni blocco; i blocchi non più usati vengono cancellati
-    /// dopo il prossimo salvataggio dell'indice.
+    /// Toglie un blocco dall'indice; i suoi frammenti si cancellano dopo il prossimo salvataggio.
+    fn forget_chunk(&mut self, id: &str) {
+        if let Some(entry) = self.index.chunks.remove(id) {
+            for (i, loc) in entry.shards.iter().enumerate() {
+                self.pending_deletes.push((loc.backend.clone(), shard_key(id, i)));
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Toglie un riferimento a ogni blocco e dimentica quelli non più usati.
     fn release(&mut self, ids: &[String]) {
         for id in ids {
-            let unused = match self.index.chunks.get_mut(id) {
-                Some(e) => {
-                    e.refs = e.refs.saturating_sub(1);
-                    e.refs == 0
-                }
-                None => false,
-            };
-            if unused {
-                let entry = self.index.chunks.remove(id).expect("blocco presente");
-                for (i, loc) in entry.shards.iter().enumerate() {
-                    self.pending_deletes.push((loc.backend.clone(), shard_key(id, i)));
+            if let Some(e) = self.index.chunks.get_mut(id) {
+                e.refs = e.refs.saturating_sub(1);
+                if e.refs == 0 {
+                    self.forget_chunk(id);
                 }
             }
             self.dirty = true;
@@ -351,34 +565,42 @@ impl Repo {
         }
     }
 
+    /// Legge in parallelo i frammenti `idx` di un blocco.
+    fn fetch_shards(&self, id: &str, entry: &ChunkEntry, idx: &[usize]) -> Vec<Shard> {
+        parallel(idx, |&i| self.fetch_shard(&entry.shards[i], &shard_key(id, i)))
+    }
+
     /// Legge un blocco: prima i frammenti di dati, la parità solo se ne manca qualcuno.
-    fn load_chunk(&self, id: &str, stats: &mut ReadStats) -> Result<Vec<u8>> {
+    /// Restituisce i dati e se è servita la parità.
+    fn load_chunk(&self, id: &str) -> Result<(Vec<u8>, bool)> {
         let e = self.index.chunks.get(id).ok_or_else(|| anyhow!("blocco {} assente dall'indice", &id[..12]))?;
         let (k, m) = (e.k as usize, e.m as usize);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
-        let mut have = 0;
-        for (i, slot) in shards.iter_mut().enumerate() {
-            if have == k {
-                break;
-            }
-            if let Shard::Ok(data) = self.fetch_shard(&e.shards[i], &shard_key(id, i)) {
-                *slot = Some(data);
-                have += 1;
+        let data_idx: Vec<usize> = (0..k).collect();
+        for (i, s) in data_idx.iter().zip(self.fetch_shards(id, e, &data_idx)) {
+            if let Shard::Ok(d) = s {
+                shards[*i] = Some(d);
             }
         }
+        let degraded = shards[..k].iter().any(Option::is_none);
+        if degraded {
+            let parity_idx: Vec<usize> = (k..k + m).collect();
+            for (i, s) in parity_idx.iter().zip(self.fetch_shards(id, e, &parity_idx)) {
+                if let Shard::Ok(d) = s {
+                    shards[*i] = Some(d);
+                }
+            }
+        }
+        let have = shards.iter().filter(|s| s.is_some()).count();
         if have < k {
             bail!("blocco {} irrecuperabile: {have} frammenti validi su {k} necessari", &id[..12]);
-        }
-        if shards[..k].iter().any(Option::is_none) {
-            stats.degraded += 1;
         }
         let sealed = erasure::decode(k, m, e.sealed_len as usize, shards)?;
         let plain = self.keys.open(&sealed)?;
         if self.keys.chunk_id(&plain) != id {
             bail!("il blocco {} non corrisponde alla sua impronta", &id[..12]);
         }
-        stats.chunks += 1;
-        Ok(plain)
+        Ok((plain, degraded))
     }
 
     /// Estrae un file del repository in `out` (scrittura atomica, impronta verificata).
@@ -394,10 +616,14 @@ impl Repo {
         let result: Result<()> = (|| {
             let mut f = fs::File::create(&tmp).with_context(|| format!("impossibile creare {}", tmp.display()))?;
             let mut hasher = blake3::Hasher::new();
-            for id in &entry.chunks {
-                let data = self.load_chunk(id, stats)?;
-                hasher.update(&data);
-                f.write_all(&data)?;
+            for group in entry.chunks.chunks(self.cfg.transfers) {
+                for loaded in parallel(group, |id| self.load_chunk(id)) {
+                    let (data, degraded) = loaded?;
+                    stats.chunks += 1;
+                    stats.degraded += degraded as u64;
+                    hasher.update(&data);
+                    f.write_all(&data)?;
+                }
             }
             f.sync_all()?;
             if hasher.finalize().to_hex().as_str() != entry.hash {
@@ -439,7 +665,13 @@ impl Repo {
         let mut out: Vec<BackendStatus> = self
             .backends
             .iter()
-            .map(|b| BackendStatus { name: b.name().to_string(), available: b.is_available(), shards: 0, bytes: 0 })
+            .map(|b| BackendStatus {
+                name: b.name().to_string(),
+                location: b.location(),
+                available: b.is_available(),
+                shards: 0,
+                bytes: 0,
+            })
             .collect();
         for e in self.index.chunks.values() {
             for loc in &e.shards {
@@ -464,93 +696,126 @@ impl Repo {
             }
         }
         let ids: Vec<String> = self.index.chunks.keys().cloned().collect();
-        for id in ids {
-            report.chunks += 1;
-            let mut entry = self.index.chunks[&id].clone();
-            let (k, m) = (entry.k as usize, entry.m as usize);
-            let states: Vec<Shard> =
-                entry.shards.iter().enumerate().map(|(i, loc)| self.fetch_shard(loc, &shard_key(&id, i))).collect();
-            let mut bad = Vec::new();
-            for (i, s) in states.iter().enumerate() {
-                match s {
-                    Shard::Ok(_) => report.shards_ok += 1,
-                    Shard::Missing => {
-                        report.shards_missing += 1;
-                        bad.push(i);
-                    }
-                    Shard::Corrupt => {
-                        report.shards_corrupt += 1;
-                        bad.push(i);
-                    }
-                }
+        for group in ids.chunks(self.cfg.transfers) {
+            let checked = parallel(group, |id| {
+                let e = &self.index.chunks[id];
+                let all: Vec<usize> = (0..e.shards.len()).collect();
+                self.fetch_shards(id, e, &all)
+            });
+            for (id, states) in group.iter().zip(checked) {
+                self.scrub_chunk(id, states, repair, &mut load, &mut report)?;
             }
-            if bad.is_empty() {
-                continue;
+            if repair {
+                self.refresh_lock();
             }
-            if k + m - bad.len() < k {
-                report.lost_chunks.push(id);
-                continue;
-            }
-            report.degraded_chunks += 1;
-            if !repair {
-                continue;
-            }
-
-            let present: Vec<Option<Vec<u8>>> = states
-                .into_iter()
-                .map(|s| match s {
-                    Shard::Ok(d) => Some(d),
-                    _ => None,
-                })
-                .collect();
-            let sealed = erasure::decode(k, m, entry.sealed_len as usize, present)?;
-            let (_, rebuilt) = erasure::encode(&sealed, k, m)?;
-            for &i in &bad {
-                if blake3::hash(&rebuilt[i]).to_hex().as_str() != entry.shards[i].hash {
-                    bail!("blocco {}: il frammento {i} ricostruito non corrisponde all'impronta", &id[..12]);
-                }
-                let holders: HashSet<&str> =
-                    entry.shards.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, l)| l.backend.as_str()).collect();
-                let original = entry.shards[i].backend.clone();
-                // prima il backend originale, poi gli altri liberi, dal meno carico
-                let mut candidates: Vec<&dyn Backend> = self
-                    .backends
-                    .iter()
-                    .map(|b| b.as_ref())
-                    .filter(|b| b.is_available() && !holders.contains(b.name()))
-                    .collect();
-                candidates.sort_by_key(|b| (b.name() != original, load.get(b.name()).copied().unwrap_or(0)));
-                let key = shard_key(&id, i);
-                let target = candidates.into_iter().find(|b| match b.put(&key, &rebuilt[i]) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!("attenzione: {e:#}");
-                        false
-                    }
-                });
-                match target {
-                    Some(b) => {
-                        let name = b.name().to_string();
-                        if name != original {
-                            *load.entry(original.clone()).or_default() -= 1;
-                            *load.entry(name.clone()).or_default() += 1;
-                            // l'eventuale copia danneggiata sul backend originale non serve più
-                            self.pending_deletes.push((original, key));
-                            entry.shards[i].backend = name;
-                        }
-                        report.repaired_shards += 1;
-                    }
-                    None => report.unrepaired_shards += 1,
-                }
-            }
-            self.index.chunks.insert(id, entry);
-            self.dirty = true;
         }
 
         let lost: BTreeSet<&String> = report.lost_chunks.iter().collect();
-        report.lost_files =
-            self.index.files.iter().filter(|(_, f)| f.chunks.iter().any(|c| lost.contains(c))).map(|(p, _)| p.clone()).collect();
+        report.lost_files = self
+            .index
+            .files
+            .iter()
+            .filter(|(_, f)| f.chunks.iter().any(|c| lost.contains(c)))
+            .map(|(p, _)| p.clone())
+            .collect();
         Ok(report)
+    }
+
+    fn scrub_chunk(
+        &mut self,
+        id: &str,
+        states: Vec<Shard>,
+        repair: bool,
+        load: &mut HashMap<String, u64>,
+        report: &mut ScrubReport,
+    ) -> Result<()> {
+        report.chunks += 1;
+        let mut entry = self.index.chunks[id].clone();
+        let (k, m) = (entry.k as usize, entry.m as usize);
+        let mut bad = Vec::new();
+        for (i, s) in states.iter().enumerate() {
+            match s {
+                Shard::Ok(_) => report.shards_ok += 1,
+                Shard::Missing => {
+                    report.shards_missing += 1;
+                    bad.push(i);
+                }
+                Shard::Corrupt => {
+                    report.shards_corrupt += 1;
+                    bad.push(i);
+                }
+            }
+        }
+        if bad.is_empty() {
+            return Ok(());
+        }
+        if k + m - bad.len() < k {
+            report.lost_chunks.push(id.to_string());
+            return Ok(());
+        }
+        report.degraded_chunks += 1;
+        if !repair {
+            return Ok(());
+        }
+
+        let present: Vec<Option<Vec<u8>>> = states
+            .into_iter()
+            .map(|s| match s {
+                Shard::Ok(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        let sealed = erasure::decode(k, m, entry.sealed_len as usize, present)?;
+        let (_, rebuilt) = erasure::encode(&sealed, k, m)?;
+        for &i in &bad {
+            if blake3::hash(&rebuilt[i]).to_hex().as_str() != entry.shards[i].hash {
+                bail!("blocco {}: il frammento {i} ricostruito non corrisponde all'impronta", &id[..12]);
+            }
+            let holders: HashSet<&str> =
+                entry.shards.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, l)| l.backend.as_str()).collect();
+            let original = entry.shards[i].backend.clone();
+            // prima il backend originale, poi gli altri liberi, dal meno carico
+            let mut candidates: Vec<&dyn Backend> = self
+                .backends
+                .iter()
+                .map(|b| b.as_ref())
+                .filter(|b| b.is_available() && !holders.contains(b.name()))
+                .collect();
+            candidates.sort_by_key(|b| (b.name() != original, load.get(b.name()).copied().unwrap_or(0)));
+            let key = shard_key(id, i);
+            let target = candidates.into_iter().find(|b| match b.put(&key, &rebuilt[i]) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("attenzione: {e:#}");
+                    false
+                }
+            });
+            match target {
+                Some(b) => {
+                    let name = b.name().to_string();
+                    if name != original {
+                        if let Some(n) = load.get_mut(&original) {
+                            *n = n.saturating_sub(1);
+                        }
+                        *load.entry(name.clone()).or_default() += 1;
+                        // l'eventuale copia danneggiata sul backend originale non serve più
+                        self.pending_deletes.push((original, key));
+                        entry.shards[i].backend = name;
+                    }
+                    report.repaired_shards += 1;
+                }
+                None => report.unrepaired_shards += 1,
+            }
+        }
+        self.index.chunks.insert(id.to_string(), entry);
+        self.dirty = true;
+        Ok(())
+    }
+}
+
+impl Drop for Repo {
+    fn drop(&mut self) {
+        self.unlock();
     }
 }
 

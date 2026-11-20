@@ -114,3 +114,10 @@ pub fn unlock(kf: &KeyFile, password: &str) -> Result<Keys> {
     let master: [u8; 32] = master.try_into().map_err(|_| anyhow!("file della chiave danneggiato"))?;
     Ok(Keys::from_master(&master))
 }
+
+/// Stringa esadecimale casuale di `bytes` byte.
+pub fn random_hex(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    OsRng.fill_bytes(&mut buf);
+    hex::encode(buf)
+}

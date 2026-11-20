@@ -1,6 +1,9 @@
 # Compila e testa dentro un container Rust: sul server non serve installare niente.
 IMAGE  ?= rust:1-bookworm
-DOCKER  = docker run --rm -v $(CURDIR):/src -w /src -e CARGO_HOME=/src/.cargo \
+# i test dei backend rclone usano il rclone dell'host, se c'è (altrimenti vengono saltati)
+RCLONE := $(shell command -v rclone 2>/dev/null)
+DOCKER  = docker run --rm -v $(CURDIR):/src -w /src -e CARGO_HOME=/src/.cargo -e HOME=/tmp \
+          $(if $(RCLONE),-v $(RCLONE):/usr/local/bin/rclone:ro) \
           -u $$(id -u):$$(id -g) $(IMAGE)
 
 .DEFAULT_GOAL := help

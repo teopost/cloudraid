@@ -7,5 +7,5 @@ pub mod erasure;
 pub mod index;
 pub mod repo;
 
-pub use config::{BackendConfig, BackendKind, ChunkConfig, Config};
+pub use config::{BackendConfig, BackendKind, ChunkConfig, Config, RcloneConfig};
 pub use repo::{ReadStats, Repo, ScrubReport};

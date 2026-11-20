@@ -1,6 +1,6 @@
 //! Test di integrazione: cartelle locali al posto degli account cloud.
 
-use cloudraid::{BackendConfig, BackendKind, ChunkConfig, Config, ReadStats, Repo};
+use cloudraid::{BackendConfig, BackendKind, ChunkConfig, Config, RcloneConfig, ReadStats, Repo};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -17,15 +17,29 @@ struct Lab {
 
 impl Lab {
     fn new(backends: usize, k: usize, m: usize) -> Lab {
+        Lab::with(backends, k, m, |_| false)
+    }
+
+    /// `use_rclone(i)`: il backend i passa da rclone (puntato comunque a una cartella locale).
+    fn with(backends: usize, k: usize, m: usize, use_rclone: impl Fn(usize) -> bool) -> Lab {
         let tmp = TempDir::new().unwrap();
         let cfg = Config {
             data_shards: k,
             parity_shards: m,
             chunk: SMALL,
+            transfers: 4,
+            rclone: RcloneConfig { config: Some("/dev/null".into()), ..RcloneConfig::default() },
             backends: (0..backends)
-                .map(|i| BackendConfig {
-                    name: format!("acc{i}"),
-                    kind: BackendKind::Local { path: tmp.path().join(format!("acc{i}")) },
+                .map(|i| {
+                    let path = tmp.path().join(format!("acc{i}"));
+                    BackendConfig {
+                        name: format!("acc{i}"),
+                        kind: if use_rclone(i) {
+                            BackendKind::Rclone { remote: path.to_str().unwrap().to_string() }
+                        } else {
+                            BackendKind::Local { path }
+                        },
+                    }
                 })
                 .collect(),
         };
@@ -355,4 +369,123 @@ fn configurazione_con_pochi_backend() {
     assert!(lab.cfg.validate().is_err());
     lab.cfg.parity_shards = 1;
     assert!(lab.cfg.validate().is_ok());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lock
+
+#[test]
+fn lock_esclusivo() {
+    let lab = Lab::new(6, 4, 2);
+    let mut a = lab.init();
+    a.lock().unwrap();
+    let mut b = lab.open();
+    let err = b.lock().unwrap_err();
+    assert!(format!("{err:#}").contains("repository in uso"), "{err:#}");
+    assert_eq!(b.locks().len(), 1);
+    // unlock senza --all non tocca un lock attivo
+    assert!(b.break_locks(false).is_empty());
+    drop(a); // rilascia il lock
+    b.lock().unwrap();
+    assert!(lab.open().locks().len() == 1);
+}
+
+#[test]
+fn lock_scaduto_ignorato_e_cancellabile() {
+    let lab = Lab::new(6, 4, 2);
+    lab.init();
+    // un lock vecchio di un'ora lasciato da un processo morto
+    let old = r#"{"id":"deadbeefdeadbeef","host":"altro","pid":1,"time":1}"#;
+    for i in 0..6 {
+        let dir = lab.backend_dir(i).join("locks");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("deadbeefdeadbeef.json"), old).unwrap();
+    }
+    let mut repo = lab.open();
+    repo.lock().unwrap(); // scaduto: non blocca
+    let removed = repo.break_locks(false);
+    assert_eq!(removed.len(), 1);
+    assert!(repo.locks().is_empty());
+    for i in 0..6 {
+        assert!(!lab.backend_dir(i).join("locks/deadbeefdeadbeef.json").exists());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Backend rclone (puntati a cartelle locali): saltati se rclone non è installato.
+
+fn have_rclone() -> bool {
+    let ok = std::process::Command::new("rclone").arg("version").output().map(|o| o.status.success()).unwrap_or(false);
+    if !ok {
+        eprintln!("rclone non trovato: test saltato");
+    }
+    ok
+}
+
+#[test]
+fn rclone_andata_ritorno_e_perdita_di_due() {
+    if !have_rclone() {
+        return;
+    }
+    let lab = Lab::with(6, 4, 2, |_| true);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    check_all(&lab, &repo, &samples);
+    drop(repo);
+    lab.lose(1);
+    lab.lose(4);
+    let repo = lab.open();
+    let st = repo.status();
+    assert!(!st[1].available && !st[4].available && st[0].available);
+    let stats = check_all(&lab, &repo, &samples);
+    assert!(stats.degraded > 0);
+}
+
+#[test]
+fn rclone_misto_con_riparazione_e_lock() {
+    if !have_rclone() {
+        return;
+    }
+    // metà backend locali, metà via rclone
+    let lab = Lab::with(6, 4, 2, |i| i % 2 == 0);
+    let mut repo = lab.init();
+    repo.lock().unwrap();
+    let samples = load_samples(&lab, &mut repo);
+    drop(repo);
+
+    lab.lose(0); // rclone
+    lab.lose(3); // locale
+    lab.replace(0);
+    lab.replace(3);
+    let mut repo = lab.open();
+    repo.lock().unwrap();
+    let r = repo.scrub(true).unwrap();
+    assert!(r.repaired_shards > 0);
+    assert_eq!(r.unrepaired_shards, 0);
+    repo.save().unwrap();
+    drop(repo);
+
+    let mut repo = lab.open();
+    let r = repo.scrub(false).unwrap();
+    assert_eq!(r.shards_missing + r.shards_corrupt, 0);
+    assert!(repo.locks().is_empty(), "lock rilasciati");
+    drop(repo);
+    lab.lose(2);
+    lab.lose(5);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn rclone_assente_errore_chiaro() {
+    let mut lab = Lab::with(6, 4, 2, |_| true);
+    lab.cfg.rclone.binary = "/non/esiste/rclone".into();
+    let err = Repo::init(lab.cfg.clone(), PW).err().expect("deve fallire");
+    assert!(format!("{err:#}").contains("rclone è installato?"), "{err:#}");
+}
+
+#[test]
+fn configurazione_di_esempio_valida() {
+    let cfg = Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/cloudraid.example.toml"))).unwrap();
+    assert_eq!(cfg.backends.len(), 6);
+    assert!(matches!(cfg.backends[4].kind, BackendKind::Rclone { .. }));
 }

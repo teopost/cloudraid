@@ -6,11 +6,22 @@
 data_shards = 4
 parity_shards = 2
 
+# Blocchi caricati o scaricati in parallelo (predefinito 4); ogni blocco manda
+# tutti i suoi frammenti in parallelo, quindi le richieste contemporanee sono
+# transfers x (data_shards + parity_shards). Abbassalo se un provider protesta.
+# transfers = 4
+
 # Dimensioni dei blocchi (facoltativo, valori predefiniti: 1, 4 e 16 MiB).
 # [chunk]
 # min = 1048576
 # avg = 4194304
 # max = 16777216
+
+# Facoltativo: come avviare rclone, per i backend di tipo "rclone".
+# [rclone]
+# binary = "rclone"
+# config = "/root/.config/rclone/rclone.conf"   # predefinito: quello di rclone
+# args = ["--tpslimit", "10"]                    # opzioni in più per `rclone rcd`
 
 # Servono almeno data_shards + parity_shards backend. Con uno in più, `scrub --repair`
 # può spostare i frammenti di un account perso anche senza sostituirlo.
@@ -34,12 +45,15 @@ name = "account4"
 type = "local"
 path = "/srv/cloudraid/account4"
 
+# Un backend rclone è un remote configurato con `rclone config`, seguito dalla
+# cartella del repository: Google Drive, OneDrive, Dropbox, MEGA, pCloud, SFTP,
+# WebDAV, S3 e tutti gli altri provider di rclone.
 [[backend]]
-name = "account5"
-type = "local"
-path = "/srv/cloudraid/account5"
+name = "gdrive"
+type = "rclone"
+remote = "gdrive:cloudraid"
 
 [[backend]]
-name = "account6"
-type = "local"
-path = "/srv/cloudraid/account6"
+name = "dropbox"
+type = "rclone"
+remote = "dropbox:cloudraid"
