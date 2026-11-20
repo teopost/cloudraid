@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Lancia cloudraid nel suo container, come se fosse installato sul server:
+#   /srv/docker/cloudraid/cloudraid put ~/foto archivio/foto
+# La cartella corrente è montata nel container, quindi i percorsi relativi funzionano.
+set -euo pipefail
+dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+tty=()
+[[ -t 0 && -t 1 ]] || tty=(-T)
+exec docker compose --progress quiet --project-directory "$dir" -f "$dir/compose.yaml" run --rm "${tty[@]}" \
+  -v "$PWD:/lavoro" -w /lavoro cloudraid "$@"

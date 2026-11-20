@@ -1,0 +1,19 @@
+# cloudraid è un programma a riga di comando, non un servizio sempre acceso:
+# si lancia con lo script ./cloudraid (es. `./cloudraid status`), che usa questo compose.
+# Il profilo "cli" evita che `docker compose up -d` lo avvii insieme alle altre app.
+services:
+  cloudraid:
+    build: .
+    image: cloudraid:local
+    profiles: ["cli"]
+    pull_policy: never     # immagine solo locale: `make build`
+    env_file:
+      - path: .env          # facoltativo: CLOUDRAID_PASSWORD per gli usi non interattivi
+        required: false
+    environment:
+      TZ: Europe/Rome
+    volumes:
+      # cloudraid.toml e rclone.conf (rclone ci riscrive i token rinnovati)
+      - ./config:/config
+      # backend locali: stesso percorso dentro e fuori dal container
+      - /srv/cloudraid:/srv/cloudraid

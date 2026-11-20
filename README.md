@@ -47,17 +47,38 @@ errori temporanei vengono ripetute fino a 4 volte.
 Un backend è **disponibile** se la sua cartella del repository esiste. Una cartella sparita (account perso, disco
 smontato) si tratta come un disco guasto.
 
-## Compilazione
+## Installazione sul server (Docker)
 
-Serve solo Docker: `make build` compila in un container `rust:1-bookworm` e produce `target/release/cloudraid`.
-`make test` lancia i test.
+Il progetto sta in `/srv/docker/cloudraid`, come le altre app. L'immagine contiene cloudraid e rclone 1.71;
+`compose.yaml` monta la configurazione (`./config`) e i backend locali (`/srv/cloudraid`).
+cloudraid è un comando, non un servizio: si lancia con lo script `./cloudraid`, che monta anche la cartella corrente,
+così i percorsi relativi funzionano come con un programma installato.
+
+```bash
+cd /srv/docker/cloudraid
+make build                                   # costruisce l'immagine cloudraid:local
+install -d -m 700 config
+cp cloudraid.example.toml config/cloudraid.toml   # poi adatta i backend
+# solo i remote di rclone che servono (rclone ci riscrive i token rinnovati):
+( umask 077; awk '/^\[/{p=($0=="[gdrive]"||$0=="[dropbox]")} p' /root/.config/rclone/rclone.conf > config/rclone.conf )
+./cloudraid init
+./cloudraid status
+```
+
+Facoltativo: `CLOUDRAID_PASSWORD` in `.env` (`chmod 600`, modello in `.env.example`) per gli usi non interattivi,
+per esempio uno `scrub` periodico da cron.
+
+`config/` e `.env` restano solo sul server (fuori da git) ed entrano nel backup orario di `/srv/docker`.
+
+## Sviluppo
+
+`make test` lancia i test in un container `rust:1-bookworm`. La cache di compilazione sta in `~/.cache/cloudraid-build`,
+fuori da `/srv/docker`, così non finisce nei backup. I test dei backend rclone usano il rclone dell'host, se c'è.
 
 ## Uso
 
 ```bash
-cp cloudraid.example.toml cloudraid.toml   # poi adatta i backend
-export CLOUDRAID_CONFIG=$PWD/cloudraid.toml   # oppure -c cloudraid.toml, predefinito ./cloudraid.toml
-
+# con Docker: /srv/docker/cloudraid/cloudraid al posto di cloudraid
 cloudraid init                     # chiede la password due volte
 cloudraid put ~/foto archivio/foto # file o cartelle
 cloudraid ls archivio
@@ -102,6 +123,10 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
   la pulizia arriverà con la fase 4.
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
   istante se ne accorgono rileggendo i lock, ma è una protezione dagli errori, non una garanzia assoluta.
+- Un backend lento rallenta tutto: le letture aspettano i frammenti di dati anche se la parità su un backend veloce
+  basterebbe. Nella prova reale (21/11/2026, 33 MB, 4 cartelle locali + Google Drive + Dropbox) `get` ha impiegato
+  99 s con Drive e 8 s senza: Google Drive col client_id condiviso di rclone risponde `RATE_LIMIT_EXCEEDED` e rclone
+  rallenta. Con Google Drive serve un **client_id proprio** (<https://rclone.org/drive/#making-your-own-client-id>).
 - Lo spazio libero dei backend non viene controllato prima di scrivere: un account pieno fa fallire la scrittura,
   che passa su un backend di riserva se c'è.
 
@@ -110,6 +135,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | Fase | Contenuto | Stato |
 |---|---|---|
 | 1 | CLI `init/put/get/ls/rm/status/scrub`, cifratura, Reed-Solomon, backend locali, test | fatta |
-| 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock` | fatta |
+| 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
+| 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
 | 3 | Mount FUSE in sola lettura con cache locale | |
 | 4 | Mount in scrittura, pulizia dei frammenti orfani, ribilanciamento | |
