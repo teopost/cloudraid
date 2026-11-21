@@ -4,6 +4,8 @@ Archivio cifrato con ridondanza **Reed-Solomon** distribuito su più storage, co
 in cui i "dischi" sono account diversi: cartelle locali, **Google Drive, OneDrive, Dropbox, WebDAV (Nextcloud) e S3**
 (Backblaze B2, Wasabi, AWS, MinIO...). Un solo binario: parla direttamente con i servizi, senza programmi esterni.
 
+**Presentazione con schermate:** https://teopost.github.io/cloudraid/ (sorgente nel ramo `gh-pages`).
+
 Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di dati e 2 di parità,
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
