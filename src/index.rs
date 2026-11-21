@@ -14,6 +14,10 @@ pub struct Index {
     /// Assente negli indici vecchi e omessa quando è vuota, così il formato resta compatibile.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub dirs: BTreeSet<String>,
+    /// Backend in dismissione: non ricevono frammenti nuovi e `retire` sposta altrove i loro.
+    /// Sta nell'indice perché valga per tutti i processi (web, mount, riga di comando).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired: BTreeSet<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

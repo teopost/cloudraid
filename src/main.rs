@@ -102,6 +102,14 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Mette in dismissione un backend e ne sposta i frammenti sugli altri (poi si può togliere o sostituire)
+    Retire {
+        /// Nome del backend
+        name: String,
+        /// Rimette in servizio il backend
+        #[arg(long)]
+        undo: bool,
+    },
     /// Cancella i lock lasciati da processi interrotti
     Unlock {
         /// Cancella anche i lock non ancora scaduti (solo se sei sicuro che nessun processo stia lavorando)
@@ -214,7 +222,12 @@ fn cmd_status(repo: &Repo, cfg: &Config) {
         println!(
             "  {:<12} {:<15} {:>8} frammenti {:>10}  {}",
             b.name,
-            if b.available { "disponibile" } else { "NON DISPONIBILE" },
+            match (b.available, b.retired) {
+                (true, false) => "disponibile",
+                (true, true) => "in dismissione",
+                (false, false) => "NON DISPONIBILE",
+                (false, true) => "dismesso, spento",
+            },
             b.shards,
             human(b.bytes),
             b.location
@@ -261,7 +274,7 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     // chi modifica il repository prende il lock esclusivo
-    if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true } | Cmd::Gc { .. } | Cmd::Rebalance { .. }) {
+    if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true } | Cmd::Gc { .. } | Cmd::Rebalance { .. } | Cmd::Retire { .. }) {
         repo.lock()?;
     }
     let result = match cli.cmd {
@@ -303,6 +316,17 @@ fn run(cli: Cli) -> Result<()> {
                 println!("  {name:<12} {:>10} -> {:>10}", human(*before), human(*after));
             }
         }),
+        Cmd::Retire { name, undo: true } => repo.unretire(&name).map(|()| {
+            println!("{name} rimesso in servizio: `cloudraid rebalance` gli ridà una parte dei frammenti");
+        }),
+        Cmd::Retire { name, undo: false } => {
+            repo.retire(&name, &mut |d, t| eprint!("\r{d}/{t} frammenti spostati")).map(|r| {
+                if r.moved + r.failed > 0 {
+                    eprintln!();
+                }
+                println!("{}", r.summary());
+            })
+        }
         Cmd::Unlock { all } => {
             let removed = repo.break_locks(all);
             for l in &removed {

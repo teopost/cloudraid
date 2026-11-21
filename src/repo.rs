@@ -172,6 +172,33 @@ impl RebalanceReport {
     }
 }
 
+/// Risultato di una dismissione.
+#[derive(Default, Debug, Clone)]
+pub struct RetireReport {
+    pub name: String,
+    pub moved: u64,
+    pub moved_bytes: u64,
+    /// Frammenti non spostati (illeggibili e non ricostruibili, o nessun backend adatto).
+    pub failed: u64,
+    /// Frammenti ancora sul backend: zero vuol dire che si può togliere dalla configurazione.
+    pub remaining: u64,
+}
+
+impl RetireReport {
+    pub fn summary(&self) -> String {
+        let mut msg = format!("{}: {} frammenti spostati ({})", self.name, self.moved, human(self.moved_bytes));
+        if self.remaining == 0 {
+            msg += ". Il backend è vuoto: ora si può togliere dalla configurazione o sostituire";
+        } else {
+            msg += &format!(". Restano {} frammenti: rilancia la dismissione", self.remaining);
+        }
+        if self.failed > 0 {
+            msg += &format!(" ({} non spostati)", self.failed);
+        }
+        msg
+    }
+}
+
 /// Uno spostamento deciso dal ribilanciamento: il frammento `shard` del blocco `id` da `from` a `to`.
 struct Move {
     id: String,
@@ -185,6 +212,8 @@ struct Move {
 pub struct BackendStatus {
     /// Tempo medio per leggere un frammento, se misurato.
     pub latency_ms: Option<f64>,
+    /// In dismissione (vedi `retire`).
+    pub retired: bool,
     pub name: String,
     /// "local" o "rclone".
     pub kind: String,
@@ -382,6 +411,11 @@ impl Repo {
 
     fn available(&self) -> Vec<usize> {
         (0..self.backends.len()).filter(|&i| self.backends[i].is_available()).collect()
+    }
+
+    /// I backend disponibili che possono ricevere frammenti (non in dismissione).
+    fn writable(&self) -> Vec<usize> {
+        self.available().into_iter().filter(|&i| !self.index.retired.contains(self.backends[i].name())).collect()
     }
 
     // -----------------------------------------------------------------------------------------
@@ -866,10 +900,10 @@ impl Repo {
         let sealed = self.keys.seal(plain);
         let (shard_len, shards) = erasure::encode(&sealed, k, m)?;
 
-        let avail = self.available();
+        let avail = self.writable();
         if avail.len() < n {
             bail!(
-                "servono {n} backend disponibili ({k} dati + {m} parità), ce ne sono {}: scrittura annullata",
+                "servono {n} backend disponibili e non in dismissione ({k} dati + {m} parità), ce ne sono {}: scrittura annullata",
                 avail.len()
             );
         }
@@ -1240,7 +1274,8 @@ impl Repo {
     /// non hanno già un frammento dello stesso blocco, solo se lo squilibrio diminuisce davvero.
     fn plan_rebalance(&self) -> (Vec<Move>, HashMap<String, u64>) {
         let mut load = self.shard_load();
-        let avail = self.available();
+        // i backend in dismissione non partecipano: li svuota `retire`
+        let avail = self.writable();
         let names: Vec<String> = self.backends.iter().map(|b| b.name().to_string()).collect();
         let pos: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
         if avail.len() < 2 {
@@ -1304,37 +1339,51 @@ impl Repo {
         if dry_run || moves.is_empty() {
             return Ok(report);
         }
+        let (moved, moved_bytes, failed) = self.execute_moves(&moves, progress)?;
+        (report.moved, report.moved_bytes, report.failed) = (moved, moved_bytes, failed);
+        report.after = sorted(self.shard_load());
+        Ok(report)
+    }
+
+    /// Esegue gli spostamenti a gruppi di `transfers`: copia il frammento (o lo ricostruisce dalla
+    /// parità se l'origine è illeggibile), aggiorna l'indice e cancella la copia vecchia dopo il
+    /// salvataggio. Restituisce spostati, byte spostati, falliti.
+    fn execute_moves(&mut self, moves: &[Move], progress: &mut dyn FnMut(u64, u64)) -> Result<(u64, u64, u64)> {
         let total = moves.len() as u64;
+        let (mut moved, mut moved_bytes, mut failed) = (0u64, 0u64, 0u64);
         let mut since_save = 0;
         for batch in moves.chunks(self.cfg.transfers.max(1)) {
             let results = parallel(batch, |mv| -> Result<()> {
                 let entry = &self.index.chunks[&mv.id];
                 let key = shard_key(&mv.id, mv.shard);
-                match self.fetch_shard(&entry.shards[mv.shard], &key) {
-                    Shard::Ok(data) => self.backends[mv.to].put(&key, &data),
-                    _ => bail!("frammento {key} illeggibile su {}: lancia scrub --repair", self.backends[mv.from].name()),
-                }
+                let data = match self.fetch_shard(&entry.shards[mv.shard], &key) {
+                    Shard::Ok(data) => data,
+                    _ => self.rebuild_shard(&mv.id, entry, mv.shard)?,
+                };
+                self.backends[mv.to].put(&key, &data)
             });
             for (mv, res) in batch.iter().zip(results) {
                 match res {
                     Ok(()) => {
                         let to = self.backends[mv.to].name().to_string();
-                        let from = self.backends[mv.from].name().to_string();
                         let key = shard_key(&mv.id, mv.shard);
                         self.index.chunks.get_mut(&mv.id).expect("blocco presente").shards[mv.shard].backend = to;
-                        self.pending_deletes.push((from, key));
+                        // la copia vecchia si cancella dopo il salvataggio (se il backend c'è ancora)
+                        if self.backends[mv.from].is_available() {
+                            self.pending_deletes.push((self.backends[mv.from].name().to_string(), key));
+                        }
                         self.dirty = true;
-                        report.moved += 1;
-                        report.moved_bytes += mv.len;
+                        moved += 1;
+                        moved_bytes += mv.len;
                         since_save += 1;
                     }
                     Err(e) => {
                         eprintln!("attenzione: {e:#}");
-                        report.failed += 1;
+                        failed += 1;
                     }
                 }
             }
-            progress(report.moved + report.failed, total);
+            progress(moved + failed, total);
             // ogni tanto si salva: un'interruzione perde poco lavoro e le copie vecchie si cancellano
             if since_save >= 64 {
                 self.save()?;
@@ -1343,8 +1392,102 @@ impl Repo {
             self.refresh_lock();
         }
         self.save()?;
-        report.after = sorted(self.shard_load());
-        Ok(report)
+        Ok((moved, moved_bytes, failed))
+    }
+
+    /// Ricostruisce il frammento `i` di un blocco dagli altri (serve quando il suo backend è
+    /// irraggiungibile o la copia è danneggiata). Il risultato ha la stessa impronta dell'originale.
+    fn rebuild_shard(&self, id: &str, e: &ChunkEntry, i: usize) -> Result<Vec<u8>> {
+        let (k, m) = (e.k as usize, e.m as usize);
+        let others: Vec<usize> = (0..k + m).filter(|&j| j != i).collect();
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
+        for (j, s) in others.iter().zip(self.fetch_shards(id, e, &others)) {
+            if let Shard::Ok(d) = s {
+                shards[*j] = Some(d);
+            }
+        }
+        let have = shards.iter().filter(|s| s.is_some()).count();
+        if have < k {
+            bail!("blocco {}: solo {have} frammenti validi, impossibile ricostruire il frammento {i}", &id[..12]);
+        }
+        let sealed = erasure::decode(k, m, e.sealed_len as usize, shards)?;
+        let (_, mut all) = erasure::encode(&sealed, k, m)?;
+        let rebuilt = std::mem::take(&mut all[i]);
+        if blake3::hash(&rebuilt).to_hex().as_str() != e.shards[i].hash {
+            bail!("blocco {}: il frammento {i} ricostruito non corrisponde all'impronta", &id[..12]);
+        }
+        Ok(rebuilt)
+    }
+
+    /// I backend in dismissione.
+    pub fn retired(&self) -> &BTreeSet<String> {
+        &self.index.retired
+    }
+
+    /// Mette in dismissione un backend e sposta tutti i suoi frammenti sugli altri, scegliendo ogni volta
+    /// il meno carico fra quelli che non hanno già un frammento dello stesso blocco: la ridondanza resta
+    /// piena per tutto il tempo. Se il backend è irraggiungibile i frammenti vengono ricostruiti dalla
+    /// parità. Si può rilanciare: riprende da dove era arrivato. Va chiamata tenendo il lock.
+    pub fn retire(&mut self, name: &str, progress: &mut dyn FnMut(u64, u64)) -> Result<RetireReport> {
+        self.need_exclusive("dismissione")?;
+        let Some(bi) = self.backends.iter().position(|b| b.name() == name) else {
+            bail!("backend {name} non presente nella configurazione");
+        };
+        let n = self.cfg.data_shards + self.cfg.parity_shards;
+        let others = self.backends.iter().filter(|b| b.name() != name && !self.index.retired.contains(b.name())).count();
+        if others < n {
+            bail!(
+                "senza {name} restano {others} backend, ne servono almeno {n} ({} dati + {} parità): \
+                 aggiungi prima alla configurazione il backend che lo sostituisce",
+                self.cfg.data_shards,
+                self.cfg.parity_shards
+            );
+        }
+        if self.index.retired.insert(name.to_string()) {
+            self.dirty = true;
+            self.save()?;
+        }
+        // il piano: ogni frammento sul backend va al meno carico fra quelli che possono riceverlo
+        let mut load = self.shard_load();
+        let targets = self.writable();
+        let mut moves = Vec::new();
+        let mut stuck = 0u64;
+        for (id, c) in &self.index.chunks {
+            let mut holders: HashSet<&str> = c.shards.iter().map(|l| l.backend.as_str()).collect();
+            for (i, loc) in c.shards.iter().enumerate() {
+                if loc.backend != name {
+                    continue;
+                }
+                let best = targets
+                    .iter()
+                    .copied()
+                    .filter(|&b| !holders.contains(self.backends[b].name()))
+                    .min_by_key(|&b| (load[self.backends[b].name()], b));
+                let Some(to) = best else {
+                    stuck += 1;
+                    continue;
+                };
+                let to_name = self.backends[to].name();
+                *load.get_mut(to_name).unwrap() += c.shard_len;
+                holders.insert(to_name);
+                moves.push(Move { id: id.clone(), shard: i, from: bi, to, len: c.shard_len });
+            }
+        }
+        let (moved, moved_bytes, failed) = self.execute_moves(&moves, progress)?;
+        let remaining = self.index.chunks.values().flat_map(|c| &c.shards).filter(|l| l.backend == name).count() as u64;
+        Ok(RetireReport { name: name.to_string(), moved, moved_bytes, failed: failed + stuck, remaining })
+    }
+
+    /// Rimette in servizio un backend in dismissione (i frammenti già spostati restano dove sono:
+    /// `rebalance` li ridistribuisce).
+    pub fn unretire(&mut self, name: &str) -> Result<()> {
+        if !self.holds_lock() {
+            bail!("serve il lock del repository");
+        }
+        if self.index.retired.remove(name) {
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> Vec<BackendStatus> {
@@ -1353,6 +1496,7 @@ impl Repo {
             .iter()
             .map(|b| BackendStatus {
                 latency_ms: self.latency.lock().unwrap().get(b.name()).copied(),
+                retired: self.index.retired.contains(b.name()),
                 name: b.name().to_string(),
                 kind: b.kind().to_string(),
                 location: b.location(),
@@ -1475,7 +1619,7 @@ impl Repo {
                 .backends
                 .iter()
                 .map(|b| b.as_ref())
-                .filter(|b| b.is_available() && !holders.contains(b.name()))
+                .filter(|b| b.is_available() && !holders.contains(b.name()) && !self.index.retired.contains(b.name()))
                 .collect();
             candidates.sort_by_key(|b| (b.name() != original, load.get(b.name()).copied().unwrap_or(0)));
             let key = shard_key(id, i);

@@ -181,6 +181,7 @@ cloudraid scrub --repair           # e ricostruisce quelli mancanti o danneggiat
 cloudraid unlock                   # cancella i lock scaduti di processi interrotti
 cloudraid gc --dry-run             # conta i frammenti orfani; senza --dry-run li cancella
 cloudraid rebalance --dry-run      # piano di ribilanciamento; senza --dry-run sposta i frammenti
+cloudraid retire account3          # dismissione: sposta altrove i frammenti di account3 (--undo per annullare)
 cloudraid mount /mnt/cloudraid --rw  # il repository come cartella (vedi sopra)
 ```
 
@@ -217,6 +218,21 @@ Misura sul repository dimostrativo (7 cartelle, 27 MB) con una cartella rallenta
   salvataggio dell'indice, che avviene ogni 64 spostamenti, così un'interruzione perde poco lavoro e lascia solo
   orfani innocui. Con i cloud costa traffico: prima guarda il piano con `--dry-run`.
 - Tutte e due sono anche nell'interfaccia web (Manutenzione), con simulazione, conferma e avanzamento.
+
+### Dismettere o sostituire un backend
+
+`cloudraid retire NOME` (o "Dismetti" sulla scheda del backend nell'interfaccia web) mette il backend **in
+dismissione**: non riceve più frammenti nuovi (né dalle scritture, né dalla riparazione, né dal ribilanciamento) e i
+suoi frammenti vengono spostati sugli altri, ognuno sul meno carico fra quelli che non hanno già un frammento dello
+stesso blocco. La ridondanza resta piena per tutto il tempo; se il backend non risponde più, i suoi frammenti vengono
+ricostruiti dalla parità. Lo stato sta nell'indice, quindi vale anche per il mount e per la riga di comando; il
+lavoro si può interrompere e riprendere. Quando il backend è vuoto (la scheda dice "dismesso") lo si toglie dalla
+configurazione, oppure lo si spegne: non conta più come guasto. `--undo` (o "Rimetti in servizio") lo riattiva e
+`rebalance` gli ridà una parte dei frammenti.
+
+Per **sostituire** un account: aggiungi alla configurazione quello nuovo (con la sua cartella creata), riavvia i
+servizi, dismetti quello vecchio. Senza il vecchio devono restare almeno `data_shards + parity_shards` backend:
+altrimenti cloudraid rifiuta e chiede di aggiungere prima il sostituto.
 
 ### Quando un backend si guasta
 
@@ -264,6 +280,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | 1 | CLI `init/put/get/ls/rm/status/scrub`, cifratura, Reed-Solomon, backend locali, test | fatta |
 | 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
 | 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
+| 5 | Dismissione di un backend (`retire`), anche dall'interfaccia web | fatta |
 | 2b | Letture "a gara": i k frammenti dai backend più rapidi, uno in più se qualcuno tarda; chiave e indice dal primo che risponde | fatta |
 | 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
 | 4a | Mount in scrittura (copia locale caricata alla chiusura), rinomine e cartelle nell'indice | fatta |

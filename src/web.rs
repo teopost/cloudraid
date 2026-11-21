@@ -136,6 +136,7 @@ struct BackendRow {
     bytes: u64,
     /// Tempo medio di lettura di un frammento, misurato da questo processo.
     latency_ms: Option<f64>,
+    retired: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -222,6 +223,7 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
                 shards: b.shards,
                 bytes: b.bytes,
                 latency_ms: b.latency_ms,
+                retired: b.retired,
             })
             .collect(),
         locks: repo
@@ -509,6 +511,28 @@ impl App {
                         repo.rebalance(dry_run, &mut |d, t| progress(d, t))?.summary(dry_run)
                     };
                     Ok((msg, None))
+                });
+                let _ = req.respond(r);
+            }
+            (Method::Post, "/api/retire") => {
+                let (name, undo) = match read_json(&mut req) {
+                    Ok(v) => (
+                        v.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        v.get("undo").and_then(Value::as_bool).unwrap_or(false),
+                    ),
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                let label = if undo { format!("Rimessa in servizio di {name}") } else { format!("Dismissione di {name}") };
+                let r = self.start_job(if undo { "unretire" } else { "retire" }, label, move |repo, progress| {
+                    repo.lock()?;
+                    if undo {
+                        repo.unretire(&name)?;
+                        return Ok((format!("{name} di nuovo in servizio: il ribilanciamento gli ridà una parte dei frammenti"), None));
+                    }
+                    Ok((repo.retire(&name, &mut |d, t| progress(d, t))?.summary(), None))
                 });
                 let _ = req.respond(r);
             }

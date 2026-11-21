@@ -782,3 +782,86 @@ fn letture_a_gara_con_backend_persi_e_lenti() {
     let err = repo.get_file("cartella/grande.bin", &lab.out("x"), &mut ReadStats::default()).unwrap_err();
     assert!(format!("{err:#}").contains("irrecuperabile"), "{err:#}");
 }
+
+#[test]
+fn dismissione_di_un_backend() {
+    let lab = Lab::new(7, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    assert!(lab.shards_on(2) > 0);
+    // senza lock niente
+    assert!(repo.retire("acc2", &mut |_, _| {}).is_err());
+    repo.lock().unwrap();
+    assert!(repo.retire("non-esiste", &mut |_, _| {}).is_err());
+    let r = repo.retire("acc2", &mut |_, _| {}).unwrap();
+    assert_eq!((r.remaining, r.failed), (0, 0), "{r:?}");
+    assert!(r.moved > 0);
+    assert_eq!(lab.shards_on(2), 0, "copie vecchie cancellate");
+    // ogni blocco ha ancora 6 frammenti su backend diversi, nessuno su acc2
+    for c in repo.index().chunks.values() {
+        let set: std::collections::HashSet<&str> = c.shards.iter().map(|l| l.backend.as_str()).collect();
+        assert_eq!(set.len(), 6);
+        assert!(!set.contains("acc2"));
+    }
+    // le scritture nuove e il ribilanciamento lo lasciano stare
+    let p = lab.src().join("dopo.bin");
+    fs::write(&p, random("dopo", 400_000)).unwrap();
+    repo.put_file(&p, "dopo.bin").unwrap();
+    repo.save().unwrap();
+    assert_eq!(repo.rebalance(true, &mut |_, _| {}).unwrap().after.iter().find(|(n, _)| n == "acc2").unwrap().1, 0);
+    assert_eq!(lab.shards_on(2), 0);
+    drop(repo);
+
+    // lo stato si salva nell'indice; il backend si può spegnere senza perdere ridondanza
+    let mut repo = lab.open();
+    assert!(repo.retired().contains("acc2"));
+    assert!(repo.status().iter().find(|b| b.name == "acc2").unwrap().retired);
+    lab.lose(2);
+    lab.lose(5);
+    lab.lose(6);
+    // persi acc5 e acc6 oltre al dismesso: si legge ancora tutto
+    let repo2 = lab.open();
+    check_all(&lab, &repo2, &samples);
+    drop(repo2);
+    lab.replace(2);
+    lab.replace(5);
+    lab.replace(6);
+    // rimesso in servizio, il ribilanciamento gli ridà frammenti
+    repo.lock().unwrap();
+    repo.scrub(true).unwrap();
+    repo.unretire("acc2").unwrap();
+    repo.save().unwrap();
+    assert!(repo.retired().is_empty());
+    repo.rebalance(false, &mut |_, _| {}).unwrap();
+    assert!(lab.shards_on(2) > 0);
+}
+
+#[test]
+fn dismissione_di_un_backend_gia_morto() {
+    let lab = Lab::new(7, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    drop(repo);
+    lab.lose(3);
+    let mut repo = lab.open();
+    repo.lock().unwrap();
+    // i suoi frammenti vengono ricostruiti dalla parità sugli altri
+    let r = repo.retire("acc3", &mut |_, _| {}).unwrap();
+    assert_eq!((r.remaining, r.failed), (0, 0), "{r:?}");
+    drop(repo);
+    // ridondanza di nuovo piena: si possono perdere altri due backend qualsiasi
+    lab.lose(0);
+    lab.lose(6);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn dismissione_rifiutata_con_pochi_backend() {
+    let lab = Lab::new(6, 4, 2);
+    let mut repo = lab.init();
+    load_samples(&lab, &mut repo);
+    repo.lock().unwrap();
+    let err = repo.retire("acc1", &mut |_, _| {}).unwrap_err();
+    assert!(format!("{err:#}").contains("aggiungi prima"), "{err:#}");
+    assert!(repo.retired().is_empty());
+}

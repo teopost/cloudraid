@@ -301,6 +301,11 @@ fn modifiche_dalla_riga_di_comando_non_vanno_perse() {
     assert_eq!(j["state"], "ok", "{j}");
     assert!(j["message"].as_str().unwrap().contains("niente da spostare"), "{j}");
 
+    // dismissione: con 6 backend e 4+2 frammenti non si può, e lo si dice chiaramente
+    let j = run_job(&lab, &cookie, "POST", "api/retire", Some(br#"{"name":"acc0"}"#));
+    assert_eq!(j["state"], "error", "{j}");
+    assert!(j["message"].as_str().unwrap().contains("aggiungi prima"), "{j}");
+
     // e la riga di comando vede tutto
     let cli = Repo::open(lab.cfg.clone(), PW).unwrap();
     assert_eq!(cli.index().files.len(), 3);

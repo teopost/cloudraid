@@ -230,7 +230,8 @@ function lastScrub(history) {
 }
 
 function health(snap, history) {
-  const down = snap.backends.filter((b) => !b.available).length;
+  // un backend dismesso e già svuotato può essere spento senza danni
+  const down = snap.backends.filter((b) => !b.available && !(b.retired && b.shards === 0)).length;
   const m = snap.parity_shards;
   const scrub = lastScrub(history);
   if (down > m) {
@@ -260,16 +261,34 @@ function renderOverview(st) {
   const m = snap.parity_shards;
   const overhead = ((k + m) / k).toLocaleString('it-IT', { maximumFractionDigits: 2 });
 
+  const dis = st.busy ? 'disabled' : '';
+  const backendState = (b) => {
+    if (b.retired && b.shards === 0) return ['ok', 'dismesso'];
+    if (b.retired) return ['warn', 'in dismissione'];
+    return b.available ? ['ok', 'disponibile'] : ['bad', 'non disponibile'];
+  };
+  const backendActions = (b) => {
+    if (!b.retired) {
+      return `<div class="card-actions"><button class="btn btn-ghost btn-sm" data-action="retire" data-name="${esc(b.name)}" ${dis}>Dismetti</button></div>`;
+    }
+    const note = b.shards === 0
+      ? '<p class="note">Vuoto: ora puoi toglierlo dalla configurazione o sostituirlo.</p>'
+      : `<p class="note">Non riceve più frammenti nuovi; ne restano ${num(b.shards)} da spostare.</p>`;
+    return `${note}<div class="card-actions">
+      ${b.shards > 0 ? `<button class="btn btn-sm" data-action="retire-resume" data-name="${esc(b.name)}" ${dis}>Riprendi lo svuotamento</button>` : ''}
+      <button class="btn btn-ghost btn-sm" data-action="unretire" data-name="${esc(b.name)}" ${dis}>Rimetti in servizio</button></div>`;
+  };
   const backends = snap.backends.map((b) => `
-    <div class="card backend ${b.available ? '' : 'down'}">
+    <div class="card backend ${b.available || (b.retired && b.shards === 0) ? '' : 'down'}">
       <div class="backend-head">
         <div class="backend-name"><span>${esc(b.name)}</span><span class="tag">${b.kind === 'rclone' ? 'rclone' : 'locale'}</span></div>
-        <span class="pill ${b.available ? 'ok' : 'bad'}">${b.available ? 'disponibile' : 'non disponibile'}</span>
+        <span class="pill ${backendState(b)[0]}">${backendState(b)[1]}</span>
       </div>
       <div class="backend-loc" title="${esc(b.location)}">${esc(b.location)}</div>
       <div class="bar"><div data-w="${(b.bytes / maxBytes) * 100}"></div></div>
       <div class="backend-nums"><span>${num(b.shards)} frammenti</span><span>${bytes(b.bytes)}</span></div>
       ${b.latency_ms != null ? `<div class="muted small">lettura di un frammento: ${b.latency_ms < 1000 ? `${Math.round(b.latency_ms)} ms` : `${(b.latency_ms / 1000).toFixed(1)} s`}</div>` : ''}
+      ${backendActions(b)}
     </div>`).join('');
 
   const locks = snap.locks.length ? `
@@ -504,7 +523,7 @@ document.addEventListener('drop', (e) => {
 
 /** Che cosa conta l'avanzamento di un'operazione. */
 function jobUnit(kind) {
-  return { gc: 'frammenti', rebalance: 'spostamenti' }[kind] || 'blocchi';
+  return { gc: 'frammenti', rebalance: 'spostamenti', retire: 'frammenti' }[kind] || 'blocchi';
 }
 
 function reportBlock(j) {
@@ -656,6 +675,23 @@ document.addEventListener('click', async (ev) => {
         return startJob('api/rebalance', { dry_run: false }, 'Ribilanciamento avviato');
       }
       return undefined;
+    case 'retire': {
+      const name = el.dataset.name;
+      const others = state.status.snapshot.backends.filter((b) => b.name !== name && !b.retired).length;
+      const need = state.status.snapshot.data_shards + state.status.snapshot.parity_shards;
+      if (others < need) {
+        toast(`Senza ${name} restano ${others} backend e ne servono ${need}: aggiungi prima alla configurazione quello che lo sostituisce`, 'bad');
+        return undefined;
+      }
+      if (await confirmDialog(`Dismettere ${name}?`, `${name} non riceverà più frammenti nuovi e i suoi verranno spostati sugli altri backend (ricostruiti dalla parità se ${name} non risponde). La ridondanza resta piena per tutto il tempo. Con i cloud può richiedere molto tempo e traffico; durante il lavoro il repository è bloccato per le altre scritture. Alla fine potrai toglierlo dalla configurazione o sostituirlo.`, 'Dismetti', false)) {
+        return startJob('api/retire', { name, undo: false }, `Dismissione di ${name} avviata`);
+      }
+      return undefined;
+    }
+    case 'retire-resume':
+      return startJob('api/retire', { name: el.dataset.name, undo: false }, 'Svuotamento ripreso');
+    case 'unretire':
+      return startJob('api/retire', { name: el.dataset.name, undo: true }, `${el.dataset.name} di nuovo in servizio`);
     case 'unlock':
       return startJob('api/unlock', { all: false });
     case 'unlock-all':
