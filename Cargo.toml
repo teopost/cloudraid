@@ -1,6 +1,6 @@
 [package]
 name = "cloudraid"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Archivio cifrato con ridondanza Reed-Solomon distribuito su più storage"
 publish = false
@@ -13,11 +13,14 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 fastcdc = "3"
+fuser = { version = "0.19", default-features = false }
 hex = "0.4"
+libc = "0.2"
 reed-solomon-simd = "3"
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signal-hook = "0.4"
 tiny_http = "0.12"
 toml = "0.8"
 ureq = { version = "2", default-features = false }

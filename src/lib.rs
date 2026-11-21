@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod erasure;
 pub mod index;
+pub mod mount;
 pub mod repo;
 pub mod web;
 

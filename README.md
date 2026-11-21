@@ -8,7 +8,7 @@ Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di d
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: fase 2 + interfaccia web (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: fase 2 + interfaccia web + mount in sola lettura (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -47,6 +47,12 @@ errori temporanei vengono ripetute fino a 4 volte.
 Un backend è **disponibile** se la sua cartella del repository esiste. Una cartella sparita (account perso, disco
 smontato) si tratta come un disco guasto.
 
+**Aggiungere un backend** a un repository esistente: aggiungi la sezione `[[backend]]` alla configurazione, crea a mano
+la cartella del repository (`mkdir` oppure `rclone mkdir nuovoaccount:cloudraid`) e riavvia i servizi. Alla prima
+scrittura il backend nuovo riceve l'indice e la chiave cifrata del repository (`cloudraid.key`), e da lì in poi i
+frammenti nuovi si distribuiscono anche su di lui; quelli già scritti restano dove sono (ribilanciamento: fase 4).
+Se la cartella contiene già la chiave di un **altro** repository, cloudraid non la tocca e avvisa.
+
 ## Interfaccia web
 
 `cloudraid serve` avvia un'interfaccia di amministrazione: stato dei backend e della ridondanza, file (sfoglia, cerca,
@@ -67,6 +73,34 @@ carica anche trascinando, scarica, elimina), verifica e riparazione con l'avanza
 Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@file`), su `https://<LAN_IP>/cloudraid/`
 (certificato non valido per un IP: il browser avvisa, come per la dashboard di Traefik) e, se impostato, su
 `https://<CLOUDRAID_HOST>/` (serve un nome che lo risolva: record DNS o file hosts).
+
+## Cartella montata (FUSE, sola lettura)
+
+```bash
+cloudraid mount /mnt/cloudraid/archivio --allow-other --uid 1000 --gid 1000
+```
+
+Il repository compare come una cartella normale: `ls`, `cp`, file manager, lettori video, condivisione in rete.
+
+- Cartelle e dimensioni vengono dall'indice in memoria: `ls` e `find` non toccano i backend.
+- Leggendo un file si scaricano solo i blocchi che servono, ognuno verificato con la sua impronta; con backend
+  persi (fino a `parity_shards`) si legge con la parità, come `get`.
+- I blocchi letti restano in una cache in memoria (`--cache-mb`, predefinito 256) e il blocco successivo viene chiesto
+  in anticipo. Le richieste sono servite in parallelo (`--threads`), così una lettura lenta non blocca `ls`.
+- Ogni `--refresh` secondi (predefinito 30) controlla se interfaccia web o riga di comando hanno salvato un indice
+  più recente: i file nuovi compaiono da soli. Il mount non prende il lock e non scrive niente.
+- Un file aperto resta com'era all'apertura anche se nel frattempo viene sostituito.
+- Permessi: file 0440, cartelle 0550, del proprietario scelto con `--uid`/`--gid`. Con `--allow-other` il kernel
+  fa entrare anche gli altri utenti secondo questi permessi (root entra comunque).
+- SIGTERM o Ctrl-C smontano in modo pulito; se il processo muore male, all'avvio successivo il mount appeso viene
+  smontato da solo.
+
+Nel compose c'è il servizio `mount`, facoltativo (profilo `mount`): metti in `.env` `COMPOSE_PROFILES=mount` e
+`CLOUDRAID_PASSWORD` (all'avvio nessuno può digitarla), poi `docker compose up -d`. Il repository compare sull'host
+in `/mnt/cloudraid/archivio` (`CLOUDRAID_MOUNT_DIR` cambia la cartella madre). Il container ha bisogno di
+`/dev/fuse`, del permesso `SYS_ADMIN` e di uscire dal profilo AppArmor `docker-default`, che vieta `mount`.
+Attenzione: `docker kill` è uno stop manuale, quindi il container non riparte da solo e lascia il mount appeso
+finché non lanci `docker compose up -d`. Un crash vero, invece, fa ripartire il container da solo.
 
 ## Installazione sul server (Docker)
 
@@ -97,6 +131,8 @@ per esempio uno `scrub` periodico da cron.
 
 `make test` lancia i test in un container `rust:1-bookworm`. La cache di compilazione sta in `~/.cache/cloudraid-build`,
 fuori da `/srv/docker`, così non finisce nei backup. I test dei backend rclone usano il rclone dell'host, se c'è.
+Il test del mount FUSE vero gira se c'è `/dev/fuse` (il Makefile passa al container dispositivo e permessi),
+altrimenti viene saltato.
 
 ## Uso
 
@@ -111,6 +147,7 @@ cloudraid status                   # backend disponibili, frammenti per backend
 cloudraid scrub                    # verifica tutti i frammenti
 cloudraid scrub --repair           # e ricostruisce quelli mancanti o danneggiati
 cloudraid unlock                   # cancella i lock scaduti di processi interrotti
+cloudraid mount /mnt/cloudraid     # il repository come cartella in sola lettura (vedi sopra)
 ```
 
 `get`, `ls`, `status` e `scrub` senza `--repair` non prendono il lock: evita di lanciarli mentre un `rm`
@@ -161,5 +198,5 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
 | 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
 | 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
-| 3 | Mount FUSE in sola lettura con cache locale | |
+| 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
 | 4 | Mount in scrittura, pulizia dei frammenti orfani, ribilanciamento | |

@@ -489,3 +489,52 @@ fn configurazione_di_esempio_valida() {
     assert_eq!(cfg.backends.len(), 6);
     assert!(matches!(cfg.backends[4].kind, BackendKind::Rclone { .. }));
 }
+
+#[test]
+fn backend_aggiunto_riceve_la_chiave() {
+    let mut lab = Lab::new(3, 2, 1);
+    let mut repo = lab.init();
+    load_samples(&lab, &mut repo);
+    drop(repo);
+
+    // un quarto account, aggiunto alla configurazione dopo init (cartella creata a mano)
+    let path = lab.tmp.path().join("acc3");
+    fs::create_dir_all(&path).unwrap();
+    lab.cfg.backends.push(BackendConfig { name: "acc3".into(), kind: BackendKind::Local { path: path.clone() } });
+    let mut repo = lab.open();
+    assert!(!path.join("cloudraid.key").exists());
+    let p = lab.src().join("dopo.bin");
+    fs::write(&p, random("dopo", 300_000)).unwrap();
+    repo.lock().unwrap();
+    repo.put_file(&p, "dopo.bin").unwrap();
+    repo.save().unwrap();
+    repo.unlock();
+    drop(repo);
+    assert!(path.join("cloudraid.key").exists(), "chiave copiata sul backend nuovo");
+
+    // ora il repository si apre anche se la chiave sparisce dagli account originali
+    for i in 0..3 {
+        fs::remove_file(lab.backend_dir(i).join("cloudraid.key")).unwrap();
+    }
+    let repo = lab.open();
+    assert!(repo.index().files.contains_key("dopo.bin"));
+}
+
+#[test]
+fn chiave_di_un_altro_repository_non_sovrascritta() {
+    let mut lab = Lab::new(3, 2, 1);
+    let mut repo = lab.init();
+    load_samples(&lab, &mut repo);
+    drop(repo);
+    // un account che contiene già un altro repository
+    let altro = Lab::new(3, 2, 1);
+    altro.init();
+    let path = altro.backend_dir(0);
+    let before = fs::read(path.join("cloudraid.key")).unwrap();
+    lab.cfg.backends.push(BackendConfig { name: "estraneo".into(), kind: BackendKind::Local { path: path.clone() } });
+    let mut repo = lab.open();
+    repo.lock().unwrap();
+    repo.remove("uno.bin").unwrap();
+    repo.save().unwrap();
+    assert_eq!(fs::read(path.join("cloudraid.key")).unwrap(), before);
+}

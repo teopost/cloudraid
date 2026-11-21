@@ -41,6 +41,8 @@ pub struct Repo {
     pending_deletes: Vec<(String, String)>,
     /// Il lock che teniamo, e quando l'abbiamo rinnovato.
     lock: Option<(LockInfo, u64)>,
+    /// Backend su cui abbiamo già controllato che ci sia `cloudraid.key`.
+    keyfile_checked: HashSet<String>,
 }
 
 /// Statistiche di lettura.
@@ -163,6 +165,7 @@ impl Repo {
             dirty: true,
             pending_deletes: Vec::new(),
             lock: None,
+            keyfile_checked: HashSet::new(),
         };
         repo.save()?;
         Ok(repo)
@@ -193,7 +196,17 @@ impl Repo {
         })?;
 
         let index = load_latest_index(&backends, &keys)?;
-        Ok(Repo { cfg, backends, keys, keyfile, index, dirty: false, pending_deletes: Vec::new(), lock: None })
+        Ok(Repo {
+            cfg,
+            backends,
+            keys,
+            keyfile,
+            index,
+            dirty: false,
+            pending_deletes: Vec::new(),
+            lock: None,
+            keyfile_checked: HashSet::new(),
+        })
     }
 
     pub fn index(&self) -> &Index {
@@ -219,15 +232,26 @@ impl Repo {
         if self.dirty {
             bail!("ci sono modifiche non salvate: impossibile rileggere l'indice");
         }
+        if let Some(index) = self.newer_index(self.index.generation)? {
+            self.index = index;
+        }
+        Ok(())
+    }
+
+    /// Verifica di nuovo i backend e restituisce l'indice più recente, ma solo se la sua
+    /// generazione è maggiore di `generation`: se nessuno ha salvato niente costa solo un elenco.
+    /// Non cambia il repository: serve a chi tiene una propria copia dell'indice (il mount).
+    pub fn newer_index(&self, generation: u64) -> Result<Option<Index>> {
         for b in &self.backends {
             b.refresh();
         }
         parallel(&self.backends, |b| b.is_available());
-        let index = load_latest_index(&self.backends, &self.keys)?;
-        if index.generation >= self.index.generation {
-            self.index = index;
+        let candidates = list_indexes(&self.backends);
+        match candidates.first() {
+            None => bail!("indice non trovato su nessun backend disponibile"),
+            Some((latest, _, _)) if *latest <= generation => Ok(None),
+            Some(_) => load_index(&self.backends, &self.keys, &candidates).map(Some),
         }
-        Ok(())
     }
 
     /// Abbandona le modifiche non salvate e torna all'indice dei backend.
@@ -377,12 +401,54 @@ impl Repo {
 
     // -----------------------------------------------------------------------------------------
 
+    /// Copia `cloudraid.key` sui backend disponibili che non ce l'hanno: succede con un backend
+    /// aggiunto alla configurazione dopo `init`. Senza la chiave, se sparissero i backend originali
+    /// il repository non si aprirebbe più. Ogni backend si controlla una volta sola per processo.
+    fn sync_keyfile(&mut self) {
+        let todo: Vec<usize> = self
+            .available()
+            .into_iter()
+            .filter(|&i| !self.keyfile_checked.contains(self.backends[i].name()))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let ours = match serde_json::to_value(&self.keyfile) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("attenzione: {e:#}");
+                return;
+            }
+        };
+        let results = parallel(&todo, |&i| -> Result<()> {
+            let b = &self.backends[i];
+            match b.get(KEYFILE)? {
+                Some(data) => {
+                    if serde_json::from_slice::<serde_json::Value>(&data).ok().as_ref() != Some(&ours) {
+                        bail!("il backend {} contiene la chiave di un altro repository", b.name());
+                    }
+                    Ok(())
+                }
+                None => b.put(KEYFILE, &serde_json::to_vec_pretty(&ours)?),
+            }
+        });
+        for (&i, res) in todo.iter().zip(results) {
+            match res {
+                Ok(()) => {
+                    self.keyfile_checked.insert(self.backends[i].name().to_string());
+                }
+                Err(e) => eprintln!("attenzione: {e:#}"),
+            }
+        }
+    }
+
     /// Salva l'indice (nuova generazione) su tutti i backend disponibili, poi esegue
     /// le cancellazioni in sospeso.
     pub fn save(&mut self) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
+        self.sync_keyfile();
         self.index.generation += 1;
         let sealed = self.keys.seal(&serde_json::to_vec(&self.index)?);
         let key = index_key(self.index.generation);
@@ -609,6 +675,13 @@ impl Repo {
     /// Restituisce i dati e se è servita la parità.
     fn load_chunk(&self, id: &str) -> Result<(Vec<u8>, bool)> {
         let e = self.index.chunks.get(id).ok_or_else(|| anyhow!("blocco {} assente dall'indice", &id[..12]))?;
+        self.read_chunk(id, e)
+    }
+
+    /// Legge un blocco descritto da `e`, che può venire da una copia dell'indice tenuta altrove
+    /// (il mount). Il contenuto è verificato con la sua impronta. Restituisce i dati e se è
+    /// servita la parità.
+    pub fn read_chunk(&self, id: &str, e: &ChunkEntry) -> Result<(Vec<u8>, bool)> {
         let (k, m) = (e.k as usize, e.m as usize);
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
         let data_idx: Vec<usize> = (0..k).collect();
@@ -865,13 +938,24 @@ impl Drop for Repo {
 
 /// L'indice più recente che si riesce a leggere, da qualsiasi backend disponibile.
 fn load_latest_index(backends: &[Box<dyn Backend>], keys: &Keys) -> Result<Index> {
+    load_index(backends, keys, &list_indexes(backends))
+}
+
+/// Le generazioni dell'indice presenti sui backend disponibili, dalla più recente:
+/// (generazione, backend, chiave).
+fn list_indexes(backends: &[Box<dyn Backend>]) -> Vec<(u64, usize, String)> {
     let listed = parallel(backends, |b| if b.is_available() { b.list(INDEX_DIR).unwrap_or_default() } else { Vec::new() });
     let mut candidates: Vec<(u64, usize, String)> = listed
         .into_iter()
         .enumerate()
         .flat_map(|(i, keys)| keys.into_iter().filter_map(move |k| parse_index_key(&k).map(|g| (g, i, k))))
         .collect();
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    candidates
+}
+
+/// Il primo indice leggibile fra i candidati (in ordine).
+fn load_index(backends: &[Box<dyn Backend>], keys: &Keys, candidates: &[(u64, usize, String)]) -> Result<Index> {
     candidates
         .iter()
         .find_map(|(generation, i, key)| {

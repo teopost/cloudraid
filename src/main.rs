@@ -62,6 +62,28 @@ enum Cmd {
         #[arg(long)]
         insecure_cookie: bool,
     },
+    /// Monta il repository come cartella in sola lettura (FUSE); resta attivo fino a Ctrl-C o SIGTERM
+    Mount {
+        /// Cartella in cui montare
+        mountpoint: PathBuf,
+        /// Ogni quanti secondi cercare un indice più recente (modifiche da web o riga di comando)
+        #[arg(long, default_value_t = 30)]
+        refresh: u64,
+        /// Memoria per i blocchi già letti, in MB
+        #[arg(long, default_value_t = 256)]
+        cache_mb: usize,
+        /// Proprietario di file e cartelle
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+        /// Accesso anche agli altri utenti, secondo i permessi (file 0440, cartelle 0550)
+        #[arg(long)]
+        allow_other: bool,
+        /// Richieste servite in parallelo
+        #[arg(long, default_value_t = 16)]
+        threads: usize,
+    },
     /// Cancella i lock lasciati da processi interrotti
     Unlock {
         /// Cancella anche i lock non ancora scaduti (solo se sei sicuro che nessun processo stia lavorando)
@@ -218,12 +240,26 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let mut repo = Repo::open(cfg.clone(), &password(false)?)?;
+    if let Cmd::Mount { mountpoint, refresh, cache_mb, uid, gid, allow_other, threads } = cli.cmd {
+        return cloudraid::mount::mount(
+            repo,
+            cloudraid::mount::MountOptions {
+                mountpoint,
+                refresh: std::time::Duration::from_secs(refresh.max(1)),
+                cache_bytes: cache_mb.max(16) << 20,
+                uid,
+                gid,
+                allow_other,
+                threads,
+            },
+        );
+    }
     // chi modifica il repository prende il lock esclusivo
     if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true }) {
         repo.lock()?;
     }
     let result = match cli.cmd {
-        Cmd::Init | Cmd::Serve { .. } => unreachable!(),
+        Cmd::Init | Cmd::Serve { .. } | Cmd::Mount { .. } => unreachable!(),
         Cmd::Put { src, dest } => cmd_put(&mut repo, &src, dest),
         Cmd::Get { path, dest } => cmd_get(&repo, &path, dest),
         Cmd::Ls { path } => {

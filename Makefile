@@ -4,9 +4,12 @@ IMAGE  ?= rust:1-bookworm
 CACHE  ?= $(HOME)/.cache/cloudraid-build
 # i test dei backend rclone usano il rclone dell'host, se c'è (altrimenti vengono saltati)
 RCLONE := $(shell command -v rclone 2>/dev/null)
+# il test del mount FUSE vero serve /dev/fuse e il permesso di montare (altrimenti viene saltato)
+FUSE   := $(if $(wildcard /dev/fuse),--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined)
 DOCKER  = docker run --rm -v $(CURDIR):/src -v $(CACHE):/cache -w /src \
           -e CARGO_HOME=/cache/cargo -e CARGO_TARGET_DIR=/cache/target -e HOME=/tmp \
           $(if $(RCLONE),-v $(RCLONE):/usr/local/bin/rclone:ro) \
+          $(FUSE) \
           -u $$(id -u):$$(id -g) $(IMAGE)
 
 .DEFAULT_GOAL := help

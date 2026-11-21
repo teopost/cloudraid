@@ -3,10 +3,12 @@
 # - web: sempre acceso, dietro Traefik, solo dalla LAN (middleware lan-only@file). Risponde su
 #   https://<LAN_IP>/cloudraid/ e, se c'è un nome che lo risolve, su https://<CLOUDRAID_HOST>/.
 #   Il login usa la password del repository, che resta solo in memoria: dopo un riavvio serve un nuovo accesso.
+# - mount: il repository come cartella in sola lettura sull'host (/mnt/cloudraid/archivio), facoltativo.
 # - cloudraid: la riga di comando, a richiesta, con lo script ./cloudraid (es. `./cloudraid status`).
 #   Il profilo "cli" evita che `docker compose up -d` lo avvii.
 #
-# In .env (vedi .env.example): LAN_IP, facoltativi CLOUDRAID_HOST e CLOUDRAID_PASSWORD (solo per la riga di comando).
+# In .env (vedi .env.example): LAN_IP; facoltativi CLOUDRAID_HOST, CLOUDRAID_PASSWORD (riga di comando
+# non interattiva e mount) e COMPOSE_PROFILES=mount per accendere il mount.
 services:
   web:
     build: .
@@ -36,6 +38,50 @@ services:
       - traefik.http.routers.cloudraid.middlewares=lan-only@file,security-headers@file,cloudraid-prefix
       - traefik.http.middlewares.cloudraid-prefix.stripprefix.prefixes=/cloudraid
       - traefik.http.services.cloudraid.loadbalancer.server.port=8080
+
+  mount:
+    # Il repository come cartella in sola lettura sull'host: ${CLOUDRAID_MOUNT_DIR}/archivio
+    # (predefinito /mnt/cloudraid/archivio). Profilo "mount": si attiva con COMPOSE_PROFILES=mount
+    # in .env, e serve CLOUDRAID_PASSWORD in .env perché all'avvio non c'è nessuno a digitarla.
+    image: cloudraid:local
+    pull_policy: never
+    container_name: cloudraid-mount
+    profiles: ["mount"]
+    command:
+      - mount
+      - /mnt/cloudraid/archivio
+      - --allow-other
+      - --uid=${CLOUDRAID_MOUNT_UID:-1000}
+      - --gid=${CLOUDRAID_MOUNT_GID:-1000}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TZ: Europe/Rome
+    # FUSE: il dispositivo, il permesso di montare e niente profilo AppArmor docker-default (vieta mount)
+    devices: [/dev/fuse]
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor=unconfined]
+    volumes:
+      - ./config:/config
+      - /srv/cloudraid:/srv/cloudraid
+      # si monta la cartella madre con propagazione condivisa: il mount fatto nel container
+      # compare sull'host, e se il processo morisse male un mount appeso in archivio/ non
+      # impedirebbe al container di ripartire (lo smonta da solo all'avvio)
+      - type: bind
+        source: ${CLOUDRAID_MOUNT_DIR:-/mnt/cloudraid}
+        target: /mnt/cloudraid
+        bind:
+          propagation: rshared
+          create_host_path: true
+    # allo stop smonta in modo pulito (SIGTERM)
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q ' /mnt/cloudraid/archivio fuse' /proc/mounts && ls /mnt/cloudraid/archivio >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   cloudraid:
     image: cloudraid:local
