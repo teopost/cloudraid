@@ -28,6 +28,7 @@ fn config(tmp: &TempDir) -> Config {
             .map(|i| BackendConfig {
                 name: format!("acc{i}"),
                 kind: BackendKind::Local { path: tmp.path().join(format!("acc{i}")) },
+                delay_ms: 0,
             })
             .collect(),
     }

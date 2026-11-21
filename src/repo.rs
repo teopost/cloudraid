@@ -10,9 +10,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{self, Backend};
 use crate::config::Config;
@@ -31,7 +32,7 @@ const LOCK_REFRESH_SECS: u64 = 5 * 60;
 
 pub struct Repo {
     cfg: Config,
-    backends: Vec<Box<dyn Backend>>,
+    backends: Vec<Arc<dyn Backend>>,
     keys: Keys,
     /// La chiave principale cifrata: serve per verificare la password senza rileggere i backend.
     keyfile: KeyFile,
@@ -44,6 +45,9 @@ pub struct Repo {
     lock: Mutex<Option<(LockInfo, u64)>>,
     /// Backend su cui abbiamo già controllato che ci sia `cloudraid.key`.
     keyfile_checked: HashSet<String>,
+    /// Tempo medio (ms, media mobile) per leggere un frammento da ogni backend: le letture chiedono
+    /// prima ai più rapidi. Condiviso con le richieste ancora in viaggio.
+    latency: Arc<Mutex<HashMap<String, f64>>>,
 }
 
 /// Un file caricato con `upload` ma non ancora registrato nell'indice.
@@ -179,6 +183,8 @@ struct Move {
 
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
+    /// Tempo medio per leggere un frammento, se misurato.
+    pub latency_ms: Option<f64>,
     pub name: String,
     /// "local" o "rclone".
     pub kind: String,
@@ -274,6 +280,7 @@ impl Repo {
             pending_deletes: Vec::new(),
             lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
+            latency: Arc::default(),
         };
         repo.save()?;
         Ok(repo)
@@ -289,19 +296,17 @@ impl Repo {
             bail!("nessun backend disponibile");
         }
 
-        let mut unlocked = None;
-        for b in backends.iter().filter(|b| b.is_available()) {
-            let Ok(Some(data)) = b.get(KEYFILE) else { continue };
-            let Ok(kf) = serde_json::from_slice::<KeyFile>(&data) else {
-                eprintln!("attenzione: {KEYFILE} danneggiato sul backend {}", b.name());
-                continue;
-            };
-            unlocked = Some((crypto::unlock(&kf, password)?, kf));
-            break;
-        }
-        let (keys, keyfile) = unlocked.ok_or_else(|| {
-            anyhow!("nessun backend disponibile contiene la chiave del repository (serve `cloudraid init`?)")
-        })?;
+        // la chiave è uguale su tutti i backend: vale la prima copia integra che arriva
+        let avail: Vec<usize> = (0..backends.len()).filter(|&i| backends[i].is_available()).collect();
+        let keyfile = race_get(&backends, &avail, KEYFILE, |i, data| match serde_json::from_slice::<KeyFile>(&data) {
+            Ok(kf) => Some(kf),
+            Err(_) => {
+                eprintln!("attenzione: {KEYFILE} danneggiato sul backend {}", backends[i].name());
+                None
+            }
+        })
+        .ok_or_else(|| anyhow!("nessun backend disponibile contiene la chiave del repository (serve `cloudraid init`?)"))?;
+        let keys = crypto::unlock(&keyfile, password)?;
 
         let index = load_latest_index(&backends, &keys)?;
         Ok(Repo {
@@ -314,6 +319,7 @@ impl Repo {
             pending_deletes: Vec::new(),
             lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
+            latency: Arc::default(),
         })
     }
 
@@ -941,18 +947,7 @@ impl Repo {
     }
 
     fn fetch_shard(&self, loc: &ShardLoc, key: &str) -> Shard {
-        let Some(b) = self.backend(&loc.backend).filter(|b| b.is_available()) else {
-            return Shard::Missing;
-        };
-        match b.get(key) {
-            Ok(Some(data)) if blake3::hash(&data).to_hex().as_str() == loc.hash => Shard::Ok(data),
-            Ok(Some(_)) => Shard::Corrupt,
-            Ok(None) => Shard::Missing,
-            Err(e) => {
-                eprintln!("attenzione: {e:#}");
-                Shard::Missing
-            }
-        }
+        fetch_from(self.backend(&loc.backend), loc, key)
     }
 
     /// Legge in parallelo i frammenti `idx` di un blocco.
@@ -960,8 +955,7 @@ impl Repo {
         parallel(idx, |&i| self.fetch_shard(&entry.shards[i], &shard_key(id, i)))
     }
 
-    /// Legge un blocco: prima i frammenti di dati, la parità solo se ne manca qualcuno.
-    /// Restituisce i dati e se è servita la parità.
+    /// Legge un blocco dell'indice (vedi `read_chunk`). Restituisce i dati e se la ridondanza era ridotta.
     fn load_chunk(&self, id: &str) -> Result<(Vec<u8>, bool)> {
         let e = self.index.chunks.get(id).ok_or_else(|| anyhow!("blocco {} assente dall'indice", &id[..12]))?;
         self.read_chunk(id, e)
@@ -972,23 +966,108 @@ impl Repo {
     /// servita la parità.
     pub fn read_chunk(&self, id: &str, e: &ChunkEntry) -> Result<(Vec<u8>, bool)> {
         let (k, m) = (e.k as usize, e.m as usize);
-        let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
-        let data_idx: Vec<usize> = (0..k).collect();
-        for (i, s) in data_idx.iter().zip(self.fetch_shards(id, e, &data_idx)) {
-            if let Shard::Ok(d) = s {
-                shards[*i] = Some(d);
-            }
+        let n = k + m;
+        if e.shards.len() != n {
+            bail!("blocco {}: numero di frammenti incoerente nell'indice", &id[..12]);
         }
-        let degraded = shards[..k].iter().any(Option::is_none);
-        if degraded {
-            let parity_idx: Vec<usize> = (k..k + m).collect();
-            for (i, s) in parity_idx.iter().zip(self.fetch_shards(id, e, &parity_idx)) {
-                if let Shard::Ok(d) = s {
-                    shards[*i] = Some(d);
+        // Lettura "a gara": bastano k frammenti qualsiasi, dati o parità. Si chiedono prima ai backend
+        // più rapidi secondo le misure (a parità, i frammenti di dati); se una risposta tarda oltre il
+        // previsto se ne chiede un altro, e vince chi arriva prima. Le richieste rimaste indietro
+        // finiscono in sottofondo e servono solo ad aggiornare le misure.
+        let lat = self.latency.lock().unwrap().clone();
+        let expected: Vec<f64> = e
+            .shards
+            .iter()
+            .map(|loc| match self.backend(&loc.backend) {
+                Some(b) if b.is_available() => lat.get(&loc.backend).copied().unwrap_or(0.0),
+                _ => f64::INFINITY,
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| expected[a].total_cmp(&expected[b]).then((a >= k).cmp(&(b >= k))).then(a.cmp(&b)));
+        // un backend irraggiungibile toglie ridondanza anche se non serve chiedergli niente
+        let mut degraded = expected.iter().any(|t| t.is_infinite());
+        // attesa prima di chiedere un frammento in più: il doppio del tempo previsto per il k-esimo
+        let kth = expected[order[k - 1]];
+        let hedge = if kth > 0.0 && kth.is_finite() {
+            Duration::from_secs_f64((kth * 2.0 + 100.0).clamp(250.0, 5000.0) / 1000.0)
+        } else {
+            Duration::from_secs(1)
+        };
+
+        let (tx, rx) = mpsc::channel::<(usize, Shard)>();
+        let launch = |i: usize| {
+            let b = self.backends.iter().find(|b| b.name() == e.shards[i].backend).cloned();
+            let (loc, key, tx, lat) = (e.shards[i].clone(), shard_key(id, i), tx.clone(), self.latency.clone());
+            thread::spawn(move || {
+                let start = Instant::now();
+                let shard = fetch_from(b.as_deref(), &loc, &key);
+                if matches!(shard, Shard::Ok(_)) {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let mut l = lat.lock().unwrap();
+                    let v = l.entry(loc.backend.clone()).or_insert(ms);
+                    *v = 0.7 * *v + 0.3 * ms;
                 }
+                let _ = tx.send((i, shard));
+            });
+        };
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+        let (mut have, mut pending, mut next) = (0usize, 0usize, 0usize);
+        let started = Instant::now();
+        let mut deadline = started + hedge;
+        // richieste in viaggio: frammento e momento della richiesta
+        let mut flying: HashMap<usize, Instant> = HashMap::new();
+        while have < k {
+            // quelli che servono, oltre a quelli già in viaggio (all'inizio k, poi uno per ogni errore)
+            while have + pending < k && next < n {
+                launch(order[next]);
+                flying.insert(order[next], Instant::now());
+                next += 1;
+                pending += 1;
+                deadline = Instant::now() + hedge;
+            }
+            if pending == 0 {
+                break;
+            }
+            let wait = if next < n { deadline.saturating_duration_since(Instant::now()) } else { Duration::from_secs(24 * 3600) };
+            match rx.recv_timeout(wait) {
+                Ok((i, Shard::Ok(d))) => {
+                    shards[i] = Some(d);
+                    have += 1;
+                    pending -= 1;
+                    flying.remove(&i);
+                    // chi è già arrivato dice quanto ci si mette: chi tarda tre volte tanto è lento
+                    // (vale anche quando le misure non ci sono ancora, per esempio appena avviati)
+                    let t = started.elapsed();
+                    deadline = deadline.min(started + (t * 3).max(t + Duration::from_millis(100)));
+                }
+                Ok((i, _)) => {
+                    pending -= 1;
+                    flying.remove(&i);
+                    degraded = true;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // chi è ancora in viaggio è lento almeno quanto l'attesa: lo si segna subito,
+                    // così le letture successive non gli chiedono più niente finché non migliora
+                    {
+                        let mut l = self.latency.lock().unwrap();
+                        for (&i, since) in &flying {
+                            let ms = since.elapsed().as_secs_f64() * 1000.0;
+                            let v = l.entry(e.shards[i].backend.clone()).or_insert(ms);
+                            *v = v.max(ms);
+                        }
+                    }
+                    if next < n {
+                        launch(order[next]);
+                        flying.insert(order[next], Instant::now());
+                        next += 1;
+                        pending += 1;
+                    }
+                    deadline = Instant::now() + hedge;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        let have = shards.iter().filter(|s| s.is_some()).count();
         if have < k {
             bail!("blocco {} irrecuperabile: {have} frammenti validi su {k} necessari", &id[..12]);
         }
@@ -1273,6 +1352,7 @@ impl Repo {
             .backends
             .iter()
             .map(|b| BackendStatus {
+                latency_ms: self.latency.lock().unwrap().get(b.name()).copied(),
                 name: b.name().to_string(),
                 kind: b.kind().to_string(),
                 location: b.location(),
@@ -1436,13 +1516,29 @@ impl Drop for Repo {
 }
 
 /// L'indice più recente che si riesce a leggere, da qualsiasi backend disponibile.
-fn load_latest_index(backends: &[Box<dyn Backend>], keys: &Keys) -> Result<Index> {
+/// Legge un frammento e ne controlla l'impronta.
+fn fetch_from(b: Option<&dyn Backend>, loc: &ShardLoc, key: &str) -> Shard {
+    let Some(b) = b.filter(|b| b.is_available()) else {
+        return Shard::Missing;
+    };
+    match b.get(key) {
+        Ok(Some(data)) if blake3::hash(&data).to_hex().as_str() == loc.hash => Shard::Ok(data),
+        Ok(Some(_)) => Shard::Corrupt,
+        Ok(None) => Shard::Missing,
+        Err(e) => {
+            eprintln!("attenzione: {e:#}");
+            Shard::Missing
+        }
+    }
+}
+
+fn load_latest_index(backends: &[Arc<dyn Backend>], keys: &Keys) -> Result<Index> {
     load_index(backends, keys, &list_indexes(backends))
 }
 
 /// Le generazioni dell'indice presenti sui backend disponibili, dalla più recente:
 /// (generazione, backend, chiave).
-fn list_indexes(backends: &[Box<dyn Backend>]) -> Vec<(u64, usize, String)> {
+fn list_indexes(backends: &[Arc<dyn Backend>]) -> Vec<(u64, usize, String)> {
     let listed = parallel(backends, |b| if b.is_available() { b.list(INDEX_DIR).unwrap_or_default() } else { Vec::new() });
     let mut candidates: Vec<(u64, usize, String)> = listed
         .into_iter()
@@ -1454,16 +1550,46 @@ fn list_indexes(backends: &[Box<dyn Backend>]) -> Vec<(u64, usize, String)> {
 }
 
 /// Il primo indice leggibile fra i candidati (in ordine).
-fn load_index(backends: &[Box<dyn Backend>], keys: &Keys, candidates: &[(u64, usize, String)]) -> Result<Index> {
-    candidates
-        .iter()
-        .find_map(|(generation, i, key)| {
-            let sealed = backends[*i].get(key).ok()??;
+fn load_index(backends: &[Arc<dyn Backend>], keys: &Keys, candidates: &[(u64, usize, String)]) -> Result<Index> {
+    // dalla generazione più recente: la stessa copia sta su più backend, vale la prima integra che arriva
+    let mut generations: Vec<u64> = candidates.iter().map(|c| c.0).collect();
+    generations.dedup();
+    for generation in generations {
+        let holders: Vec<usize> = candidates.iter().filter(|c| c.0 == generation).map(|c| c.1).collect();
+        let found = race_get(backends, &holders, &index_key(generation), |_, sealed| {
             let plain = keys.open(&sealed).ok()?;
             let index: Index = serde_json::from_slice(&plain).ok()?;
-            (index.generation == *generation).then_some(index)
-        })
-        .ok_or_else(|| anyhow!("indice non trovato su nessun backend disponibile"))
+            (index.generation == generation).then_some(index)
+        });
+        if let Some(index) = found {
+            return Ok(index);
+        }
+    }
+    bail!("indice non trovato su nessun backend disponibile")
+}
+
+/// Legge `key` da più backend insieme e restituisce il primo risultato che `accept` approva; le
+/// richieste rimaste indietro finiscono in sottofondo. Così un backend lento non rallenta l'apertura.
+fn race_get<T>(
+    backends: &[Arc<dyn Backend>],
+    idx: &[usize],
+    key: &str,
+    mut accept: impl FnMut(usize, Vec<u8>) -> Option<T>,
+) -> Option<T> {
+    let (tx, rx) = mpsc::channel();
+    for &i in idx {
+        let (b, key, tx) = (backends[i].clone(), key.to_string(), tx.clone());
+        thread::spawn(move || {
+            let _ = tx.send((i, b.get(&key).ok().flatten()));
+        });
+    }
+    drop(tx);
+    while let Ok((i, data)) = rx.recv() {
+        if let Some(v) = data.and_then(|d| accept(i, d)) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 fn prune_indexes(b: &dyn Backend) -> Result<()> {

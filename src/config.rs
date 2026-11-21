@@ -72,6 +72,9 @@ pub struct BackendConfig {
     pub name: String,
     #[serde(flatten)]
     pub kind: BackendKind,
+    /// Solo per prove: ritardo artificiale in millisecondi su ogni lettura, per simulare un account lento.
+    #[serde(default)]
+    pub delay_ms: u64,
 }
 
 #[derive(Deserialize, Clone, Debug)]

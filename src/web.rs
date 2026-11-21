@@ -134,6 +134,8 @@ struct BackendRow {
     available: bool,
     shards: u64,
     bytes: u64,
+    /// Tempo medio di lettura di un frammento, misurato da questo processo.
+    latency_ms: Option<f64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -219,6 +221,7 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
                 available: b.available,
                 shards: b.shards,
                 bytes: b.bytes,
+                latency_ms: b.latency_ms,
             })
             .collect(),
         locks: repo

@@ -20,7 +20,7 @@ fn config(tmp: &Path) -> Config {
         transfers: 4,
         rclone: RcloneConfig::default(),
         backends: (0..6)
-            .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) } })
+            .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) }, delay_ms: 0 })
             .collect(),
     }
 }

@@ -43,24 +43,73 @@ pub trait Backend: Send + Sync {
 }
 
 /// Apre tutti i backend della configurazione; avvia rclone solo se serve.
-pub fn open_all(cfg: &Config) -> Result<Vec<Box<dyn Backend>>> {
+pub fn open_all(cfg: &Config) -> Result<Vec<Arc<dyn Backend>>> {
     let needs_rclone = cfg.backends.iter().any(|b| matches!(b.kind, BackendKind::Rclone { .. }));
     let daemon = if needs_rclone { Some(Arc::new(RcloneDaemon::start(&cfg.rclone)?)) } else { None };
     Ok(cfg
         .backends
         .iter()
-        .map(|b| -> Box<dyn Backend> {
-            match &b.kind {
-                BackendKind::Local { path } => Box::new(Local { name: b.name.clone(), root: path.clone() }),
-                BackendKind::Rclone { remote } => Box::new(Rclone {
+        .map(|b| -> Arc<dyn Backend> {
+            let backend: Arc<dyn Backend> = match &b.kind {
+                BackendKind::Local { path } => Arc::new(Local { name: b.name.clone(), root: path.clone() }),
+                BackendKind::Rclone { remote } => Arc::new(Rclone {
                     name: b.name.clone(),
                     remote: remote.clone(),
                     daemon: daemon.clone().expect("rclone avviato"),
                     available: Mutex::new(None),
                 }),
+            };
+            if b.delay_ms > 0 {
+                Arc::new(Slow { inner: backend, delay: std::time::Duration::from_millis(b.delay_ms) })
+            } else {
+                backend
             }
         })
         .collect())
+}
+
+/// Un backend rallentato apposta (`delay_ms` nella configurazione): per provare le letture con un
+/// account lento senza averne uno.
+struct Slow {
+    inner: Arc<dyn Backend>,
+    delay: std::time::Duration,
+}
+
+impl Backend for Slow {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn location(&self) -> String {
+        format!("{} (rallentato di {} ms)", self.inner.location(), self.delay.as_millis())
+    }
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+    fn create(&self) -> Result<()> {
+        self.inner.create()
+    }
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data)
+    }
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        std::thread::sleep(self.delay);
+        self.inner.get(key)
+    }
+    fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key)
+    }
+    fn list(&self, dir: &str) -> Result<Vec<String>> {
+        self.inner.list(dir)
+    }
+    fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_all(dir)
+    }
+    fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+    fn refresh(&self) {
+        self.inner.refresh()
+    }
 }
 
 fn check_key(key: &str) -> Result<()> {

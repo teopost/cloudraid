@@ -269,6 +269,7 @@ function renderOverview(st) {
       <div class="backend-loc" title="${esc(b.location)}">${esc(b.location)}</div>
       <div class="bar"><div data-w="${(b.bytes / maxBytes) * 100}"></div></div>
       <div class="backend-nums"><span>${num(b.shards)} frammenti</span><span>${bytes(b.bytes)}</span></div>
+      ${b.latency_ms != null ? `<div class="muted small">lettura di un frammento: ${b.latency_ms < 1000 ? `${Math.round(b.latency_ms)} ms` : `${(b.latency_ms / 1000).toFixed(1)} s`}</div>` : ''}
     </div>`).join('');
 
   const locks = snap.locks.length ? `

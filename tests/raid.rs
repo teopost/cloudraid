@@ -39,6 +39,7 @@ impl Lab {
                         } else {
                             BackendKind::Local { path }
                         },
+                        delay_ms: 0,
                     }
                 })
                 .collect(),
@@ -500,7 +501,7 @@ fn backend_aggiunto_riceve_la_chiave() {
     // un quarto account, aggiunto alla configurazione dopo init (cartella creata a mano)
     let path = lab.tmp.path().join("acc3");
     fs::create_dir_all(&path).unwrap();
-    lab.cfg.backends.push(BackendConfig { name: "acc3".into(), kind: BackendKind::Local { path: path.clone() } });
+    lab.cfg.backends.push(BackendConfig { name: "acc3".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0 });
     let mut repo = lab.open();
     assert!(!path.join("cloudraid.key").exists());
     let p = lab.src().join("dopo.bin");
@@ -531,7 +532,7 @@ fn chiave_di_un_altro_repository_non_sovrascritta() {
     altro.init();
     let path = altro.backend_dir(0);
     let before = fs::read(path.join("cloudraid.key")).unwrap();
-    lab.cfg.backends.push(BackendConfig { name: "estraneo".into(), kind: BackendKind::Local { path: path.clone() } });
+    lab.cfg.backends.push(BackendConfig { name: "estraneo".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0 });
     let mut repo = lab.open();
     repo.lock().unwrap();
     repo.remove("uno.bin").unwrap();
@@ -661,7 +662,7 @@ fn ribilanciamento_dopo_un_backend_aggiunto() {
     for i in 6..8 {
         let path = lab.tmp.path().join(format!("acc{i}"));
         fs::create_dir_all(&path).unwrap();
-        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path } });
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0 });
     }
     let mut repo = lab.open();
     repo.lock().unwrap();
@@ -725,4 +726,59 @@ fn rclone_pulizia_con_elenco_ricorsivo() {
     assert_eq!(dry.scanned as usize, (0..6).map(|i| lab.shards_on(i)).sum::<usize>());
     assert_eq!(repo.gc(false, &mut |_, _| {}).unwrap().deleted, 1);
     assert!(!orphan.exists());
+}
+
+/// Un laboratorio con alcuni backend rallentati apposta.
+fn slow_lab(slow: &[usize], delay_ms: u64) -> Lab {
+    let mut lab = Lab::new(6, 4, 2);
+    for &i in slow {
+        lab.cfg.backends[i].delay_ms = delay_ms;
+    }
+    lab
+}
+
+#[test]
+fn letture_a_gara_un_backend_lento_non_blocca() {
+    let lab = slow_lab(&[0], 1500);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    drop(repo);
+    let repo = lab.open();
+    let blocks: usize = repo.index().chunks.len();
+    assert!(blocks > 20, "servono molti blocchi: {blocks}");
+    // senza la gara ogni blocco con un frammento di dati su acc0 aspetterebbe 1,5 s
+    let start = std::time::Instant::now();
+    let stats = check_all(&lab, &repo, &samples);
+    let took = start.elapsed();
+    assert!(took < std::time::Duration::from_secs(8), "{blocks} blocchi letti in {took:?}");
+    assert_eq!(stats.degraded, 0, "nessun backend guasto: la ridondanza è piena");
+    // il backend lento è stato misurato come tale
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let st = repo.status();
+    let lat = |n: &str| st.iter().find(|b| b.name == n).unwrap().latency_ms;
+    // (scartato presto, la sua media non arriva per forza a 1,5 s: basta che sia molto più lento degli altri)
+    let (slow, fast) = (lat("acc0").unwrap(), lat("acc1").unwrap());
+    assert!(slow > 200.0 && slow > 10.0 * fast, "acc0 {slow} ms, acc1 {fast} ms");
+}
+
+#[test]
+fn letture_a_gara_con_backend_persi_e_lenti() {
+    let lab = slow_lab(&[0], 300);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    drop(repo);
+    // un backend perso e uno lento: bastano i 4 rimasti veloci, ma la ridondanza è ridotta
+    lab.lose(3);
+    let stats = check_all(&lab, &lab.open(), &samples);
+    assert!(stats.degraded > 0);
+    // due persi: per forza anche il lento, ma si legge tutto
+    lab.lose(4);
+    let start = std::time::Instant::now();
+    check_all(&lab, &lab.open(), &samples);
+    assert!(start.elapsed() > std::time::Duration::from_millis(300), "ha dovuto aspettare il lento");
+    // tre persi: errore pulito, senza restare appesi
+    lab.lose(5);
+    let repo = lab.open();
+    let err = repo.get_file("cartella/grande.bin", &lab.out("x"), &mut ReadStats::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("irrecuperabile"), "{err:#}");
 }

@@ -68,6 +68,7 @@ h3 { font-size: 1rem; font-weight: 650; }
 .muted { color: var(--muted); }
 .mono { font-family: var(--mono); font-size: .86em; }
 .nowrap { white-space: nowrap; }
+.small { font-size: .8rem; }
 
 /* ---------- pulsanti e campi ---------- */
 .btn {

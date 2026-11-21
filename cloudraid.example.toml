@@ -29,6 +29,8 @@ parity_shards = 2
 name = "account1"
 type = "local"
 path = "/srv/cloudraid/account1"
+# solo per prove: ogni lettura da questo backend aspetta 1,5 s, come un account lento
+# delay_ms = 1500
 
 [[backend]]
 name = "account2"

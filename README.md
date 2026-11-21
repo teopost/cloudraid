@@ -8,7 +8,7 @@ Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di d
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: fasi 1-4 complete: interfaccia web, mount in lettura e scrittura, pulizia e ribilanciamento (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: tutte le fasi previste completate: interfaccia web, mount in lettura e scrittura, letture "a gara", pulizia e ribilanciamento (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -190,6 +190,21 @@ o uno `scrub --repair` stanno cancellando o spostando frammenti.
 La password si può passare anche con la variabile `CLOUDRAID_PASSWORD` (utile negli script).
 **Senza password i dati non si recuperano in nessun modo**: salvala nel password manager.
 
+### Letture "a gara"
+
+Per ricostruire un blocco bastano k frammenti qualsiasi, di dati o di parità. cloudraid misura quanto ci mette ogni
+backend a consegnare un frammento (media mobile, visibile nelle schede dei backend dell'interfaccia web) e chiede i
+k frammenti ai più rapidi. Se una risposta tarda (il doppio del previsto, oppure tre volte quanto hanno impiegato le
+risposte già arrivate) chiede un frammento in più a un altro backend e usa i primi k che arrivano; il backend che
+tardava viene segnato subito come lento e lasciato per ultimo finché non migliora. Le richieste rimaste indietro finiscono
+in sottofondo. Allo stesso modo la chiave e l'indice, all'apertura, si prendono dal primo backend che risponde.
+
+Misura sul repository dimostrativo (7 cartelle, 27 MB) con una cartella rallentata di 1,5 s a lettura (`delay_ms`):
+`get` di tutto in 0,7 s, come senza rallentamenti; quando il backend lento serve per forza (due cartelle spente)
+15,8 s. Prima di questa versione ogni blocco con un frammento di dati sul backend lento lo aspettava.
+
+`delay_ms` nella sezione di un backend (solo per prove) rallenta apposta ogni sua lettura.
+
 ### Pulizia e ribilanciamento
 
 - `cloudraid gc` elenca tutti gli oggetti nelle cartelle `data/` dei backend (su rclone con una sola chiamata
@@ -233,10 +248,12 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
   `cloudraid gc` li cancella.
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
   istante se ne accorgono rileggendo i lock, ma è una protezione dagli errori, non una garanzia assoluta.
-- Un backend lento rallenta tutto: le letture aspettano i frammenti di dati anche se la parità su un backend veloce
-  basterebbe. Nella prova reale (21/11/2026, 33 MB, 4 cartelle locali + Google Drive + Dropbox) `get` ha impiegato
-  99 s con Drive e 8 s senza: Google Drive col client_id condiviso di rclone risponde `RATE_LIMIT_EXCEEDED` e rclone
-  rallenta. Con Google Drive serve un **client_id proprio** (<https://rclone.org/drive/#making-your-own-client-id>).
+- Le **scritture** vanno alla velocità del backend più lento: ogni blocco ha un frammento su ognuno di k + m backend.
+  Nella prova reale (21/11/2026, 33 MB, 4 cartelle locali + Google Drive + Dropbox) `put` ha impiegato 537 s:
+  Google Drive col client_id condiviso di rclone risponde `RATE_LIMIT_EXCEEDED` e rclone rallenta. Con Google Drive
+  serve un **client_id proprio** (<https://rclone.org/drive/#making-your-own-client-id>).
+- Anche l'elenco delle versioni dell'indice, all'apertura, aspetta tutti i backend: serve a non perdere l'indice
+  più recente se è rimasto solo su un backend.
 - Lo spazio libero dei backend non viene controllato prima di scrivere: un account pieno fa fallire la scrittura,
   che passa su un backend di riserva se c'è.
 
@@ -247,7 +264,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | 1 | CLI `init/put/get/ls/rm/status/scrub`, cifratura, Reed-Solomon, backend locali, test | fatta |
 | 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
 | 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
-| 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
+| 2b | Letture "a gara": i k frammenti dai backend più rapidi, uno in più se qualcuno tarda; chiave e indice dal primo che risponde | fatta |
 | 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
 | 4a | Mount in scrittura (copia locale caricata alla chiusura), rinomine e cartelle nell'indice | fatta |
 | 4 | Pulizia dei frammenti orfani (`gc`) e ribilanciamento (`rebalance`), da riga di comando e interfaccia web | fatta |
