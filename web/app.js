@@ -1111,9 +1111,10 @@ const APP_GUIDES = [
     steps: [
       'Apri <a href="https://console.cloud.google.com/" target="_blank" rel="noopener noreferrer">console.cloud.google.com</a> con il tuo account Google e crea un progetto (per esempio "cloudraid").',
       'In "API e servizi", "Libreria", cerca <strong>Google Drive API</strong> e premi "Abilita".',
-      'In "Schermata consenso OAuth" (o "Google Auth Platform"): tipo <strong>Esterno</strong>, nome dell\'app "cloudraid", la tua email. Tra gli ambiti aggiungi <code>.../auth/drive.file</code>.',
-      'Pubblica l\'app ("In produzione"): con il solo ambito drive.file non serve la verifica di Google, e i collegamenti non scadono dopo 7 giorni come in modalità test.',
-      'In "Credenziali", "Crea credenziali", "ID client OAuth", tipo <strong>TV e dispositivi con input limitato</strong>. Copia qui ID client e client secret.',
+      'Apri <strong>Google Auth Platform</strong> (menu a sinistra, oppure cerca "Google Auth Platform" in alto). Se è la prima volta premi <strong>Inizia</strong> (Get started): nome dell\'app "cloudraid", la tua email di assistenza, pubblico <strong>Esterno</strong> (External), la tua email come contatto, accetta e premi Crea.',
+      'In <strong>Accesso ai dati</strong> (Data Access) premi <strong>Aggiungi o rimuovi ambiti</strong>, cerca <code>drive.file</code>, spunta <code>.../auth/drive.file</code>, premi Aggiorna e poi <strong>Salva</strong> in fondo alla pagina.',
+      'In <strong>Pubblico</strong> (Audience) premi <strong>Pubblica app</strong> e conferma: lo stato diventa "In produzione". Con il solo ambito drive.file non serve la verifica di Google, e i collegamenti non scadono dopo 7 giorni come in modalità test.',
+      'In <strong>Client</strong> (Clients) premi <strong>Crea client</strong>, tipo di applicazione <strong>TV e dispositivi con input limitato</strong>, nome "cloudraid", Crea. Copia qui ID client e client secret (il secret si vede anche dopo, aprendo il client).',
     ],
   },
   {

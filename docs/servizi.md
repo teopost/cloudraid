@@ -314,13 +314,24 @@ personale "da solo": l'app deve stare in una directory (tenant) Microsoft Entra
 1. Registrazione dell'app (una volta):
    1. Apri <https://console.cloud.google.com/> e crea un progetto (es. `cloudraid`).
    2. **API e servizi** → **Libreria**: cerca **Google Drive API** e premi **Abilita**.
-   3. **Schermata consenso OAuth** (o *Google Auth Platform*):
-      - tipo **Esterno**, nome `cloudraid`, la tua email;
-      - tra gli ambiti aggiungi `.../auth/drive.file`.
-   4. **Pubblica** l'app (stato *In produzione*). Con il solo ambito `drive.file` non serve la verifica di Google. In
-      modalità test, invece, i collegamenti scadono dopo 7 giorni.
-   5. **Credenziali** → **Crea credenziali** → **ID client OAuth**, tipo **TV e dispositivi con input limitato**. Copia
-      nell'interfaccia ID client e client secret.
+   3. Apri **Google Auth Platform** (menu a sinistra, oppure cerca "Google Auth Platform" nella barra in alto). Se è la
+      prima volta, premi **Inizia** (*Get started*) e compila:
+      - nome dell'app `cloudraid` e la tua email di assistenza;
+      - pubblico **Esterno** (*External*);
+      - la tua email come contatto.
+
+      Accetta le norme e premi **Crea**.
+   4. **Accesso ai dati** (*Data Access*) → **Aggiungi o rimuovi ambiti**: cerca `drive.file`, spunta
+      `.../auth/drive.file`, premi **Aggiorna** e poi **Salva** in fondo alla pagina.
+   5. **Pubblico** (*Audience*) → **Pubblica app** → conferma: lo stato diventa *In produzione*. Con il solo ambito
+      `drive.file` non serve la verifica di Google. In modalità test, invece, i collegamenti scadono dopo 7 giorni.
+   6. **Client** (*Clients*) → **Crea client**:
+      - tipo di applicazione **TV e dispositivi con input limitato**;
+      - nome `cloudraid`, poi **Crea**.
+
+      Copia nell'interfaccia ID client e client secret: il secret si rivede anche dopo, aprendo il client.
+
+   La console vecchia aveva le stesse cose sotto "Schermata consenso OAuth" e "Credenziali".
 2. Aggiunta dello spazio:
    1. Spazi → Aggiungi uno spazio → **Google Drive**.
    2. Scegli il nome della cartella nel Drive (predefinito `cloudraid`).

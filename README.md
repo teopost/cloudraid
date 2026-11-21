@@ -82,10 +82,14 @@ Per collegare account di questi tre servizi, cloudraid deve essere registrato co
 dal tuo account, e metti i valori in Spazi → "Collegamento con Google, Microsoft e Dropbox" (finiscono nella sezione
 `[apps]` di `cloudraid.toml`; non sono password). La stessa finestra contiene queste guide passo passo:
 
-- **Google Drive**: console.cloud.google.com → nuovo progetto → abilita *Google Drive API* → schermata di consenso
-  OAuth di tipo *Esterno* con l'ambito `.../auth/drive.file` → **pubblica** l'app (con il solo drive.file non serve la
-  verifica, e i collegamenti non scadono dopo 7 giorni come in modalità test) → Credenziali → ID client OAuth di tipo
-  **TV e dispositivi con input limitato** → `google_client_id` e `google_client_secret`.
+- **Google Drive**: console.cloud.google.com → nuovo progetto → abilita *Google Drive API* → **Google Auth Platform**:
+  - Inizia: app `cloudraid`, pubblico *Esterno*;
+  - Accesso ai dati: ambito `.../auth/drive.file`;
+  - Pubblico: **Pubblica app** (con il solo drive.file non serve la verifica, e i collegamenti non scadono dopo 7 giorni
+    come in modalità test);
+  - Client: Crea client di tipo **TV e dispositivi con input limitato**.
+
+  Da lì `google_client_id` e `google_client_secret`. Nella console vecchia: "Schermata consenso OAuth" e "Credenziali".
 - **OneDrive**: entra.microsoft.com → Registrazioni app → nuova, account Microsoft personali → Autenticazione:
   **Consenti flussi client pubblici = Sì** → autorizzazioni Graph `Files.ReadWrite.AppFolder` e `offline_access` →
   `onedrive_client_id` (ID applicazione).
