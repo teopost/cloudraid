@@ -283,7 +283,10 @@ niente:
 - **Cartelle sullo stesso disco:** si dividono la capienza del disco in parti uguali. Un blocco mette **al massimo m
   frammenti sullo stesso disco**, se si può: così un disco guasto non costa più della parità. Con 3 cartelle su un disco
   e 3 servizi cloud i blocchi diventano 3 + 2, 2 frammenti sul disco e 3 sul cloud, e sopravvivono al guasto del disco.
-  Se non si può (per esempio, solo cartelle sullo stesso disco) si scrive senza questo vincolo. Il ribilanciamento
+  Quando gli spazi attivi permettono di rispettarlo, il vincolo vale sempre: finito lo spazio che lo rispetta, le
+  scritture si fermano con "spazio protetto esaurito", invece di finire su un solo disco. Anche la stima della
+  capienza conta solo quello spazio. Se il vincolo non si può rispettare per come sono fatti gli spazi (per esempio solo
+  cartelle sullo stesso disco), si scrive senza, e la Panoramica lo segnala. Il ribilanciamento
   sposta per primi i frammenti di troppo su un disco, quando c'è un backend su cui metterli. L'interfaccia avvisa delle
   cartelle sullo stesso disco.
 - **Meno di k + m backend con posto** (per esempio uno spazio piccolo pieno, o uno spento): il blocco usa meno frammenti

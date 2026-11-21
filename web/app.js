@@ -320,6 +320,18 @@ function renderCapacity(snap) {
   }
   const total = used + left;
   const p = total > 0 ? (100 * used) / total : 0;
+  // spazio allocato su tutti gli spazi attivi (usato + ancora utilizzabile)
+  const active = snap.backends.filter((b) => !b.retired);
+  const caps = active.map((b) => spaceOf(b).cap);
+  const allocated = caps.every((c) => c != null) ? caps.reduce((a, c) => a + c, 0) : null;
+  const k = snap.data_shards;
+  const m = snap.parity_shards;
+  const ideal = allocated != null ? (allocated * k) / (k + m) : null;
+  const shared = active.filter((b) => b.same_device && b.same_device.length).map((b) => b.name);
+  let why = '';
+  if (ideal != null && total < ideal * 0.9) {
+    why = `<p class="muted small">Con la ridondanza (${k} + ${m}, cioè ${((k + m) / k).toLocaleString('it-IT', { maximumFractionDigits: 2 })} volte) ${size(allocated)} basterebbero per circa ${size(ideal)} di file: qui sono ${size(total)} perché gli spazi piccoli si riempiono prima${shared.length ? ` e su ${shared.join(', ')}, che stanno sullo stesso disco, va al massimo ${m === 1 ? 'un pezzo' : `${m} pezzi`} per blocco` : ''}. Quando lo spazio protetto finisce, i file nuovi vengono rifiutati invece di finire in un posto meno sicuro. Un altro spazio${shared.length ? ' fuori da quel disco' : ''} aumenta la capienza.</p>`;
+  }
   return `<div class="card capacity-card">
     <div class="capacity-head">
       <h3>Spazio</h3>
@@ -330,7 +342,8 @@ function renderCapacity(snap) {
       <span>${pct(p)} occupato</span>
       <span>${size(left)} liberi per i file nuovi</span>
     </div>
-    <p class="muted small">Come un unico disco: spazio per i file, già al netto della ridondanza (sui servizi i pezzi occupano ${size(onServices)}). La capienza dipende dallo spazio allocato o libero su ogni servizio.</p>
+    <p class="muted small">Come un unico disco: spazio per i file, già al netto della ridondanza.${allocated != null ? ` Sugli spazi sono allocati <strong>${size(allocated)}</strong>, di cui ${size(onServices)} occupati dai pezzi.` : ` Sui servizi i pezzi occupano ${size(onServices)}.`}</p>
+    ${why}
   </div>`;
 }
 

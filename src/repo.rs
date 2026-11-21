@@ -1269,26 +1269,31 @@ impl Repo {
         let writable = self.writable();
         let mut free: Vec<i64> = writable.iter().map(|&bi| fm[&bi].max(0)).collect();
         let device = |j: usize| devices[writable[j]];
-        let finite: i64 = free.iter().filter(|&&f| f < UNLIMITED / 2).sum();
-        // passo: abbastanza piccolo da essere preciso, abbastanza grande da finire presto
-        let unit = (finite / 4000).max(64 << 10);
+        // come in scrittura: il vincolo del disco vale se gli spazi attivi permettono di rispettarlo
+        let all: Vec<usize> = (0..free.len()).collect();
+        let per_device = if pick_spread(&all, m + 1, m, &device).is_some() { m } else { usize::MAX };
+        // passo adattivo: ogni volta metà dello spazio più piccolo fra i backend scelti (mai meno di un
+        // frammento minimo), così è preciso con spazi di qualunque dimensione e finisce in pochi passi
+        const MIN_SHARD: i64 = 64 << 10;
         let mut total: i64 = 0;
-        for _ in 0..200_000 {
+        for _ in 0..100_000 {
             let mut order: Vec<usize> = (0..free.len()).collect();
             order.sort_unstable_by_key(|&j| std::cmp::Reverse(free[j]));
+            let eligible: Vec<usize> = order.into_iter().filter(|&j| free[j] >= MIN_SHARD).collect();
             let mut placed = false;
-            'search: for max_per_device in [m, usize::MAX] {
-                for kk in (1..=k).rev() {
-                    let need = (unit + kk as i64 - 1) / kk as i64;
-                    let eligible: Vec<usize> = order.iter().copied().filter(|&j| free[j] >= need).collect();
-                    if let Some(chosen) = pick_spread(&eligible, kk + m, max_per_device, &device) {
-                        for &j in &chosen[..kk + m] {
-                            free[j] -= need;
-                        }
-                        total += unit;
-                        placed = true;
-                        break 'search;
+            for kk in (1..=k).rev() {
+                if let Some(chosen) = pick_spread(&eligible, kk + m, per_device, &device) {
+                    let smallest = chosen[..kk + m].iter().map(|&j| free[j]).min().unwrap_or(0);
+                    if smallest >= UNLIMITED / 2 {
+                        return None; // abbastanza spazi senza limite noto
                     }
+                    let shard = (smallest / 2).max(MIN_SHARD).min(smallest);
+                    for &j in &chosen[..kk + m] {
+                        free[j] -= shard;
+                    }
+                    total += shard * kk as i64;
+                    placed = true;
+                    break;
                 }
             }
             if !placed {
@@ -1328,20 +1333,31 @@ impl Repo {
         let devices: HashMap<usize, Option<u64>> =
             avail.iter().map(|&bi| (bi, cache.by_name.get(self.backends[bi].name()).and_then(|s| s.device))).collect();
         let device = |bi: usize| devices.get(&bi).copied().flatten();
+        // il vincolo vale sempre se gli spazi attivi permettono di rispettarlo: quando finisce lo spazio
+        // che lo rispetta le scritture si fermano, invece di finire su un solo disco. Se non si può
+        // rispettare per come sono fatti gli spazi (solo cartelle sullo stesso disco), si scrive senza
+        // e l'interfaccia lo segnala.
+        let protected = pick_spread(&avail, m + 1, m, &device).is_some();
+        let max_per_device = if protected { m } else { usize::MAX };
         let mut plan = None;
-        'search: for max_per_device in [m, usize::MAX] {
-            for kk in (1..=k).rev() {
-                let need = shard_len_for(sealed.len(), kk) as i64;
-                let eligible: Vec<usize> = cands.iter().filter(|c| c.1 >= need).map(|c| c.0).collect();
-                if let Some(order) = pick_spread(&eligible, kk + m, max_per_device, &device) {
-                    plan = Some((kk, order));
-                    break 'search;
-                }
+        for kk in (1..=k).rev() {
+            let need = shard_len_for(sealed.len(), kk) as i64;
+            let eligible: Vec<usize> = cands.iter().filter(|c| c.1 >= need).map(|c| c.0).collect();
+            if let Some(order) = pick_spread(&eligible, kk + m, max_per_device, &device) {
+                plan = Some((kk, order));
+                break;
             }
         }
         let Some((k, order)) = plan else {
+            if protected {
+                bail!(
+                    "spazio protetto esaurito: non ci sono {} spazi con posto libero su dischi o servizi diversi \
+                     (aggiungi uno spazio o aumenta lo spazio allocato di un servizio)",
+                    m + 1
+                );
+            }
             bail!(
-                "spazio esaurito: servono almeno {} spazi con posto libero e non ci sono (aggiungi uno spazio o alza un limite)",
+                "spazio esaurito: servono almeno {} spazi con posto libero e non ci sono (aggiungi uno spazio o aumenta lo spazio allocato)",
                 m + 1
             );
         };

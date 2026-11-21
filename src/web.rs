@@ -892,9 +892,28 @@ impl App {
     /// Avvia un'operazione in background. `work` riceve il repository e una funzione per l'avanzamento.
     /// Le impostazioni delle app, senza aspettare un'operazione in corso.
     fn apps_config(&self) -> Result<crate::config::AppsConfig, Resp> {
-        match self.repo.try_lock() {
-            Ok(g) => g.as_ref().map(|r| r.config().apps.clone()).ok_or_else(|| error(409, "repository non aperto")),
-            Err(_) => Err(error(409, "c'è un'operazione in corso: riprova quando finisce")),
+        match self.repo_briefly() {
+            Some(g) => g.as_ref().map(|r| r.config().apps.clone()).ok_or_else(|| error(409, "repository non aperto")),
+            None => Err(error(409, "c'è un'operazione in corso: riprova quando finisce")),
+        }
+    }
+
+    /// Il repository, se non c'è un'operazione in corso. Il controllo periodico dell'indice lo tiene
+    /// per pochi istanti: in quel caso si aspetta (al massimo 15 s) invece di rispondere "occupato".
+    fn repo_briefly(&self) -> Option<MutexGuard<'_, Option<Repo>>> {
+        let start = Instant::now();
+        loop {
+            match self.repo.try_lock() {
+                Ok(g) => return Some(g),
+                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => {
+                    let job = lock(&self.job).as_ref().is_some_and(|j| j.state == "running");
+                    if job || start.elapsed() > Duration::from_secs(15) {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
         }
     }
 
@@ -1170,12 +1189,9 @@ impl App {
         };
         let tmp = std::env::temp_dir().join(format!("cloudraid-download-{}", random_hex(8)));
         let result = {
-            let guard = match self.repo.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    let _ = req.respond(error(409, "operazione in corso: riprova quando è finita"));
-                    return;
-                }
+            let Some(guard) = self.repo_briefly() else {
+                let _ = req.respond(error(409, "operazione in corso: riprova quando è finita"));
+                return;
             };
             match guard.as_ref() {
                 None => Err(anyhow!("repository non aperto")),

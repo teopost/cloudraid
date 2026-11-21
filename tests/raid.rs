@@ -972,3 +972,46 @@ fn backend_di_riserva_rispetta_il_disco() {
     drop(repo);
     check_all(&lab, &lab.open(), &samples);
 }
+
+#[test]
+fn scritture_ferme_quando_finisce_lo_spazio_protetto() {
+    // tre cartelle grandi su un disco, tre piccole (300 kB) su un altro: finché le piccole hanno
+    // posto i blocchi sono 2 + 2 (2 pezzi per disco); poi le scritture si fermano invece di finire
+    // tutte sul primo disco, e la stima della capienza conta solo lo spazio protetto
+    use std::os::unix::fs::MetadataExt;
+    let other = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut lab = Lab::new(3, 4, 2);
+    if fs::metadata(lab.tmp.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+        eprintln!("un solo filesystem disponibile: test saltato");
+        return;
+    }
+    for i in 3..6 {
+        let path = other.path().join(format!("svc{i}"));
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0, limit_gb: Some(0.000_3) });
+    }
+    drop(lab.init());
+    let mut repo = lab.open();
+    let left = repo.capacity_left().unwrap();
+    // 3 × 300 kB sul secondo disco, metà dei pezzi di ogni blocco: circa 900 kB di file
+    assert!((700_000..=1_000_000).contains(&left), "capienza protetta stimata: {left}");
+    let mut stored = 0usize;
+    let mut err = None;
+    for i in 0..20 {
+        let p = lab.src().join(format!("p{i}"));
+        fs::write(&p, random(&format!("p{i}"), 150_000)).unwrap();
+        match repo.put_file(&p, &format!("p{i}.bin")) {
+            Ok(_) => stored += 150_000,
+            Err(e) => {
+                err = Some(format!("{e:#}"));
+                break;
+            }
+        }
+    }
+    let err = err.expect("le scritture devono fermarsi");
+    assert!(err.contains("spazio protetto esaurito"), "{err}");
+    assert!(stored as u64 >= left / 2, "salvati {stored} su {left} stimati");
+    for c in repo.index().chunks.values() {
+        let first = c.shards.iter().filter(|l| l.backend.trim_start_matches("acc").parse::<usize>().unwrap() < 3).count();
+        assert!(first <= 2, "un blocco con {first} pezzi sul primo disco");
+    }
+}
