@@ -679,7 +679,7 @@ function renderSpaces(st) {
     else if (!b.available) state = ['bad', 'non raggiungibile'];
     else if (b.shards === 0) state = ['run', 'nuovo, ancora vuoto'];
     else state = ['ok', 'in uso'];
-    const actions = [];
+    const actions = [`<button class="btn btn-ghost btn-sm" data-action="rename-space" data-name="${esc(b.name)}" ${dis}>Rinomina</button>`];
     if (!b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="retire" data-name="${esc(b.name)}" ${dis}>Dismetti</button>`);
     if (b.retired && b.shards > 0) actions.push(`<button class="btn btn-sm" data-action="retire-resume" data-name="${esc(b.name)}" ${dis}>Riprendi lo svuotamento</button>`);
     if (b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="unretire" data-name="${esc(b.name)}" ${dis}>Rimetti in servizio</button>`);
@@ -990,11 +990,11 @@ const APP_GUIDES = [
     title: 'OneDrive',
     fields: [['onedrive_client_id', 'ID applicazione (client)']],
     steps: [
-      'Apri <a href="https://entra.microsoft.com/" target="_blank" rel="noopener noreferrer">entra.microsoft.com</a> (o portal.azure.com) con un account Microsoft.',
-      '"Registrazioni app", "Nuova registrazione": nome "cloudraid", tipi di account: <strong>account Microsoft personali</strong> (o anche aziendali, se ti servono).',
-      'In "Autenticazione", alla voce "Consenti flussi client pubblici", scegli <strong>Sì</strong> e salva.',
-      'In "Autorizzazioni API" aggiungi per Microsoft Graph (delegate) <code>Files.ReadWrite.AppFolder</code> e <code>offline_access</code>.',
-      'Copia qui l\'"ID applicazione (client)" dalla pagina Panoramica dell\'app.',
+      'Apri <a href="https://entra.microsoft.com/" target="_blank" rel="noopener noreferrer">entra.microsoft.com</a> (o portal.azure.com) con il tuo account Microsoft personale. Microsoft vuole che l\'app stia in una "directory": se la registrazione dà un errore tipo "outside of a directory", attiva prima un account Azure gratuito con lo stesso account. Non usare la directory del lavoro.',
+      '"Registrazioni app", "Nuova registrazione": nome <strong>cloudraid</strong> (sarà il nome della cartella nel tuo OneDrive), tipi di account: <strong>Account in qualsiasi directory organizzativa e account Microsoft personali</strong>, URI di reindirizzamento vuoto.',
+      'In "Autenticazione", in fondo, alla voce "Consenti flussi client pubblici", scegli <strong>Sì</strong> e salva.',
+      'In "Autorizzazioni API", "Aggiungi un\'autorizzazione", Microsoft Graph, autorizzazioni delegate: <code>Files.ReadWrite.AppFolder</code> e <code>offline_access</code>. Non serve il consenso amministratore.',
+      'Copia qui l\'"ID applicazione (client)" dalla pagina Panoramica dell\'app. Il nome dell\'app si può correggere anche dopo, in "Personalizzazione e proprietà".',
     ],
   },
   {
@@ -1004,7 +1004,7 @@ const APP_GUIDES = [
     steps: [
       'Apri <a href="https://www.dropbox.com/developers/apps" target="_blank" rel="noopener noreferrer">dropbox.com/developers/apps</a> e premi "Create app".',
       'Scegli <strong>Scoped access</strong> e <strong>App folder</strong> (cloudraid vedrà solo la sua cartella), nome per esempio "cloudraid-casa".',
-      'Nella scheda "Permissions" spunta <code>files.content.write</code>, <code>files.content.read</code> e <code>files.metadata.read</code>, poi "Submit".',
+      'Nella scheda "Permissions" spunta <code>files.content.write</code>, <code>files.content.read</code> e <code>files.metadata.read</code>, poi premi <strong>Submit</strong> in fondo alla pagina (senza Submit i permessi non vengono salvati).',
       'Nella scheda "Settings" copia qui la <strong>App key</strong> (non serve l\'App secret).',
     ],
   },
@@ -1057,6 +1057,26 @@ document.addEventListener('submit', (ev) => {
 });
 
 $('#wizard').addEventListener('close', stopLinkPoll);
+
+$('#rename-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const dlg = $('#rename-dialog');
+  const name = dlg.dataset.name;
+  const newName = $('#rename-input').value.trim();
+  if (newName === name) {
+    dlg.close();
+    return;
+  }
+  try {
+    await api('api/backends/rename', { method: 'POST', body: { name, new_name: newName } });
+    dlg.close();
+    toast(`Rinomina di ${name} avviata`);
+    await refresh();
+  } catch (e) {
+    $('#rename-error').textContent = e.message;
+    $('#rename-error').hidden = false;
+  }
+});
 
 // ---------------------------------------------------------------------------------------------
 // Attività
@@ -1173,6 +1193,18 @@ document.addEventListener('click', async (ev) => {
     case 'wiz-rebalance':
       closeWizard();
       return startJob('api/rebalance', { dry_run: false }, 'Ribilanciamento avviato');
+    case 'rename-space': {
+      const dlg = $('#rename-dialog');
+      dlg.dataset.name = el.dataset.name;
+      $('#rename-title').textContent = `Rinomina ${el.dataset.name}`;
+      $('#rename-input').value = el.dataset.name;
+      $('#rename-error').hidden = true;
+      dlg.showModal();
+      $('#rename-input').select();
+      return undefined;
+    }
+    case 'rename-close':
+      return $('#rename-dialog').close();
     case 'remove-space': {
       const name = el.dataset.name;
       if (await confirmDialog(`Togliere ${name}?`, `${name} è vuoto: viene tolto dalla configurazione e le sue credenziali vengono cancellate. I file sul servizio (se ne restano) non vengono toccati.`, 'Togli')) {

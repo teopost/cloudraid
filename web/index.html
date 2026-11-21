@@ -67,6 +67,22 @@
     </form>
   </dialog>
 
+  <dialog id="rename-dialog" class="dialog" aria-labelledby="rename-title">
+    <form id="rename-form" autocomplete="off">
+      <h3 id="rename-title">Rinomina lo spazio</h3>
+      <p class="muted">Cambia solo il nome con cui cloudraid lo chiama: i dati restano dove sono e non viene spostato niente.
+        La cartella sul servizio non cambia nome.</p>
+      <label class="field-label" for="rename-input">Nome nuovo</label>
+      <input id="rename-input" name="new_name" type="text" required maxlength="40" pattern="[a-z0-9_\-]+" spellcheck="false">
+      <p class="field-help">Solo lettere minuscole, cifre, - e _.</p>
+      <p id="rename-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-action="rename-close">Annulla</button>
+        <button type="submit" class="btn btn-primary">Rinomina</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Procedura guidata per aggiungere uno spazio: fuori dalle viste, così gli aggiornamenti
        periodici della pagina non cancellano quello che si sta scrivendo -->
   <dialog id="wizard" class="dialog dialog-wide" aria-labelledby="wizard-title">

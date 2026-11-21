@@ -20,6 +20,7 @@ fn config(tmp: &Path) -> Config {
         transfers: 4,
         apps: AppsConfig::default(),
         dir: None,
+        file: None,
         backends: (0..6)
             .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) }, delay_ms: 0 })
             .collect(),

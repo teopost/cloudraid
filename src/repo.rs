@@ -51,6 +51,14 @@ pub struct Repo {
     /// Tempo medio (ms, media mobile) per leggere un frammento da ogni backend: le letture chiedono
     /// prima ai più rapidi. Condiviso con le richieste ancora in viaggio.
     latency: Arc<Mutex<HashMap<String, f64>>>,
+    /// Data di modifica del file di configurazione quando l'abbiamo letto: se cambia (un altro
+    /// processo ha aggiunto, tolto o rinominato un backend), chi prende il lock lo rilegge.
+    config_seen: Option<std::time::SystemTime>,
+}
+
+/// Data di modifica del file da cui viene la configurazione.
+fn config_mtime(cfg: &Config) -> Option<std::time::SystemTime> {
+    std::fs::metadata(cfg.file.as_ref()?).ok()?.modified().ok()
 }
 
 /// Un file caricato con `upload` ma non ancora registrato nell'indice.
@@ -317,7 +325,9 @@ impl Repo {
             lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
             latency: Arc::default(),
+            config_seen: None,
         };
+        repo.config_seen = config_mtime(&repo.cfg);
         repo.save()?;
         Ok(repo)
     }
@@ -363,6 +373,7 @@ impl Repo {
             bail!("nessun backend disponibile");
         }
         let index = load_latest_index(&backends, &keys)?;
+        let config_seen = config_mtime(&cfg);
         Ok(Repo {
             cfg,
             backends,
@@ -375,6 +386,7 @@ impl Repo {
             lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
             latency: Arc::default(),
+            config_seen,
         })
     }
 
@@ -388,6 +400,7 @@ impl Repo {
         let creds = Credentials::load(cfg.dir.as_deref(), self.keys.clone())?;
         let backends = backend::open_all(&cfg, &creds);
         parallel(&backends, |b| b.is_available());
+        self.config_seen = config_mtime(&cfg);
         self.cfg = cfg;
         self.creds = creds;
         self.backends = backends;
@@ -530,6 +543,7 @@ impl Repo {
         if self.holds_lock() {
             return Ok(());
         }
+        self.reload_config_if_changed();
         let busy = |locks: Vec<LockInfo>, mine: &str| {
             locks.into_iter().find(|l| l.id != mine && now().saturating_sub(l.time) < LOCK_STALE_SECS)
         };
@@ -563,6 +577,24 @@ impl Repo {
             }
         }
         Ok(())
+    }
+
+    /// Se il file di configurazione è cambiato dopo la lettura (per esempio un backend aggiunto o
+    /// rinominato dall'interfaccia web mentre gira il mount), lo rilegge: chi scrive deve usare gli
+    /// stessi nomi dei backend che ci sono nell'indice.
+    fn reload_config_if_changed(&mut self) {
+        if self.dirty {
+            return;
+        }
+        let Some(path) = self.cfg.file.clone() else { return };
+        let now = config_mtime(&self.cfg);
+        if now.is_none() || now == self.config_seen {
+            return;
+        }
+        match Config::load(&path).and_then(|cfg| self.reconfigure(cfg)) {
+            Ok(()) => eprintln!("configurazione riletta: {} backend", self.cfg.backends.len()),
+            Err(e) => eprintln!("attenzione: configurazione nuova non applicata: {e:#}"),
+        }
     }
 
     /// Rinnova il lock se è passato abbastanza tempo; chiamato durante le operazioni lunghe.
@@ -1286,7 +1318,19 @@ impl Repo {
                 orphans.push((bi, mine));
             }
         }
-        if dry_run || report.orphans == 0 {
+        if dry_run {
+            return Ok(report);
+        }
+        // cartelle della prova di un backend nuovo rimaste dalle versioni fino alla 0.9 (contengono
+        // solo file di prova): una richiesta per backend, e se non ci sono non succede niente
+        parallel(&self.backends, |b| {
+            if b.is_available() {
+                if let Err(e) = b.remove_dir(backend::PROBE_DIR) {
+                    eprintln!("attenzione: {e:#}");
+                }
+            }
+        });
+        if report.orphans == 0 {
             return Ok(report);
         }
         // a lotti, in parallelo; l'avanzamento fra un lotto e l'altro
@@ -1531,6 +1575,30 @@ impl Repo {
 
     /// Rimette in servizio un backend in dismissione (i frammenti già spostati restano dove sono:
     /// `rebalance` li ridistribuisce).
+    /// Cambia il nome di un backend nell'indice (frammenti e dismissioni). Va chiamata tenendo il
+    /// lock, insieme al cambio di nome nella configurazione; poi `save`.
+    pub fn rename_backend_refs(&mut self, old: &str, new: &str) -> Result<u64> {
+        if !self.holds_lock() {
+            bail!("serve il lock del repository");
+        }
+        let mut n = 0;
+        for chunk in self.index.chunks.values_mut() {
+            for s in chunk.shards.iter_mut().filter(|s| s.backend == old) {
+                s.backend = new.to_string();
+                n += 1;
+            }
+        }
+        if self.index.retired.remove(old) {
+            self.index.retired.insert(new.to_string());
+        }
+        let mut lat = self.latency.lock().unwrap();
+        if let Some(v) = lat.remove(old) {
+            lat.insert(new.to_string(), v);
+        }
+        self.dirty = true;
+        Ok(n)
+    }
+
     pub fn unretire(&mut self, name: &str) -> Result<()> {
         if !self.holds_lock() {
             bail!("serve il lock del repository");

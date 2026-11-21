@@ -257,6 +257,11 @@ impl Backend for Dropbox {
         }
     }
 
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        // la cancellazione per percorso vale anche per le cartelle (con il contenuto)
+        self.delete(dir)
+    }
+
     fn list(&self, dir: &str) -> Result<Vec<String>> {
         super::check_key(dir)?;
         Ok(self.list_folder(dir, false)?.into_iter().map(|(k, _)| k).collect())

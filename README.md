@@ -115,6 +115,10 @@ carica anche trascinando, scarica, elimina), verifica e riparazione con l'avanza
 - Protezioni: richieste di modifica solo con l'intestazione `X-Cloudraid: 1` (CSRF), Content-Security-Policy senza script né stili
   inline, nessuna libreria esterna.
 - Cronologia delle operazioni in `config/web-state.json` (niente segreti).
+- **Spazi**: aggiungere (con la prova, che alla fine cancella il file e la cartella `prova`), dismettere, togliere e
+  **rinominare**. La rinomina cambia il nome nella configurazione, nelle credenziali e nell'indice. I frammenti restano
+  dove sono, perché sui servizi il nome non compare. Mount e riga di comando rileggono la configurazione quando prendono
+  il lock, così scrivono sempre con i nomi dell'indice.
 
 Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@file`), su `https://<LAN_IP>/cloudraid/`
 (certificato non valido per un IP: il browser avvisa, come per la dashboard di Traefik) e, se impostato, su

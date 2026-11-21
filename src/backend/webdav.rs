@@ -235,6 +235,25 @@ impl Backend for Webdav {
         })
     }
 
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        super::check_key(dir)?;
+        let url = format!("{}/", self.url(dir));
+        http::retry(&format!("backend {}: cancellazione della cartella {dir}", self.name), || {
+            let req = match self.request("DELETE", &url) {
+                Ok(r) => r,
+                Err(e) => return Step::Fail(e),
+            };
+            match http::send(req, None) {
+                Outcome::Response(r) if (200..300).contains(&r.status()) || r.status() == 404 => Step::Done(()),
+                Outcome::Response(r) => http::unexpected(r),
+                Outcome::Transport(e) => Step::Retry(e, None),
+            }
+        })?;
+        let prefix = format!("{dir}/");
+        self.dirs.lock().unwrap().retain(|d| d != dir && !d.starts_with(&prefix));
+        Ok(())
+    }
+
     fn list(&self, dir: &str) -> Result<Vec<String>> {
         super::check_key(dir)?;
         Ok(self.propfind(dir)?.unwrap_or_default().into_iter().filter(|(_, d, _)| !d).map(|(k, _, _)| k).collect())

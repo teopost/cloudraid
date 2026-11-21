@@ -25,6 +25,7 @@ fn config(tmp: &TempDir) -> Config {
         transfers: 4,
         apps: AppsConfig::default(),
         dir: None,
+        file: None,
         backends: (0..6)
             .map(|i| BackendConfig {
                 name: format!("acc{i}"),

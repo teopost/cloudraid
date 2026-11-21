@@ -4,6 +4,13 @@ Come configurare ogni servizio come spazio (backend) di cloudraid. Gli spazi si 
 **Spazi** → **Aggiungi uno spazio**. Prima di salvare, cloudraid prova lo spazio: crea la cartella, scrive, rilegge,
 elenca e cancella un file di prova. Se qualcosa non va, l'interfaccia spiega cosa e non salva niente.
 
+La prova cancella il file e la cartella che ha creato: sul servizio resta solo la cartella del repository. Le versioni
+fino alla 0.9 lasciavano una cartella vuota `prova`: la toglie **Pulisci** (pulizia dei frammenti orfani, nella
+pagina Manutenzione), oppure si può cancellare a mano.
+
+Il nome di uno spazio si può cambiare in ogni momento con **Rinomina**: cambia solo il nome con cui cloudraid lo chiama,
+i dati restano dove sono e la cartella sul servizio non cambia nome.
+
 Password, chiavi segrete e token non finiscono mai in `cloudraid.toml`. Vanno in `config/credenziali.bin`, cifrati con
 la chiave del repository.
 
@@ -232,30 +239,68 @@ Ti consiglio di cominciare da **Dropbox**: bastano 5 minuti e nessuna verifica.
 1. Registrazione dell'app (una volta):
    1. Apri <https://www.dropbox.com/developers/apps> → **Create app**.
    2. Scegli **Scoped access** e **App folder**, con un nome per esempio `cloudraid-casa`.
-   3. Scheda **Permissions**: spunta `files.content.write`, `files.content.read` e `files.metadata.read`, poi
-      **Submit**.
+   3. Scheda **Permissions**: spunta `files.content.write`, `files.content.read` e `files.metadata.read`, poi premi
+      **Submit** in fondo alla pagina. Ricarica la pagina e controlla che le spunte siano rimaste: senza Submit non
+      vengono salvate.
    4. Scheda **Settings**: copia la **App key** nell'interfaccia. L'App secret non serve.
 2. Aggiunta dello spazio:
    1. Spazi → Aggiungi uno spazio → **Dropbox** → **Collega l'account**.
    2. Si apre la pagina di Dropbox: acconsenti e copia il codice che compare.
    3. Incollalo nella finestra di cloudraid.
 
+| Errore | Causa e rimedio |
+|---|---|
+| `does not have the required scope 'files.content.write'` | all'app manca il permesso. Abilitalo nella scheda Permissions, premi **Submit**, poi ricollega l'account dall'inizio, con un codice nuovo: i permessi vengono fissati nel token al momento del collegamento |
+
 ### OneDrive
 
-5 GB gratis. cloudraid vede solo la propria cartella `Applicazioni/<nome app>`.
+5 GB gratis. cloudraid vede solo la propria cartella `App/<nome app>` (in inglese `Apps/<nome app>`).
+
+**Prima di cominciare: serve una "directory".** Microsoft non permette più di registrare app nuove con un account
+personale "da solo": l'app deve stare in una directory (tenant) Microsoft Entra
+([Microsoft Learn](https://learn.microsoft.com/en-us/entra/identity-platform/reference-breaking-changes)).
+- Se il tuo account ne ha già una (per esempio perché hai usato Azure), la registrazione funziona e basta.
+- Se compare un errore del tipo *"creating applications outside of a directory..."*, crea una directory gratuita
+  attivando un account Azure gratuito (azure.microsoft.com) con lo stesso account Microsoft. Chiede la carta di
+  credito solo per verificare l'identità.
+- Non usare la directory del lavoro: l'app finirebbe sotto il controllo dell'azienda, e spesso gli utenti non possono
+  crearne.
 
 1. Registrazione dell'app (una volta):
-   1. Apri <https://entra.microsoft.com> (o portal.azure.com) con un account Microsoft.
-   2. **Registrazioni app** → **Nuova registrazione**: nome `cloudraid`, tipo di account **account Microsoft
-      personali**.
-   3. **Autenticazione**: alla voce **Consenti flussi client pubblici** scegli **Sì** e salva.
-   4. **Autorizzazioni API**: aggiungi per Microsoft Graph (delegate) `Files.ReadWrite.AppFolder` e `offline_access`.
-   5. Copia nell'interfaccia l'**ID applicazione (client)**, dalla pagina Panoramica.
+   1. Apri <https://entra.microsoft.com> (o portal.azure.com) con il tuo account Microsoft personale.
+   2. **Registrazioni app** → **Nuova registrazione**:
+      - **Nome:** `cloudraid`. È il nome della cartella che comparirà nel tuo OneDrive: controlla di averlo scritto
+        giusto (si può cambiare dopo, vedi sotto);
+      - **Tipi di account supportati:** **"Account in qualsiasi directory organizzativa e account Microsoft
+        personali"**. Senza "account Microsoft personali" non puoi collegare il tuo OneDrive;
+      - **URI di reindirizzamento:** lascialo vuoto.
+   3. **Autenticazione**: in fondo, alla voce **Consenti flussi client pubblici**, scegli **Sì** e premi **Salva**.
+      Senza questo il collegamento con il codice non funziona.
+   4. **Autorizzazioni API** → **Aggiungi un'autorizzazione** → **Microsoft Graph** → **Autorizzazioni delegate**:
+      aggiungi `Files.ReadWrite.AppFolder` e `offline_access`. Non serve il "consenso amministratore".
+   5. Dalla pagina **Panoramica** copia l'**ID applicazione (client)** (una stringa come `1a2b3c4d-...`) in Spazi →
+      **Collegamento con Google, Microsoft e Dropbox**, campo OneDrive, poi **Salva**.
 2. Aggiunta dello spazio:
-   1. Spazi → Aggiungi uno spazio → **OneDrive** → **Collega l'account**.
-   2. cloudraid mostra un indirizzo e un codice (es. `ABCD-EFGH`). Aprilo da qualsiasi dispositivo, anche dal telefono,
-      e inserisci il codice.
-   3. La finestra si accorge da sola quando hai finito.
+   1. Spazi → Aggiungi uno spazio → **OneDrive**, nome per esempio `onedrive`, poi **Collega l'account**.
+   2. cloudraid mostra un indirizzo (`microsoft.com/devicelogin`) e un codice (es. `ABCD-EFGH`). Aprilo da qualsiasi
+      dispositivo, anche dal telefono, inserisci il codice ed entra con l'account **che possiede il OneDrive da
+      usare**.
+   3. Accetta i permessi: cloudraid vedrà solo la sua cartella `App/<nome app>`.
+   4. La finestra si accorge da sola quando hai finito, fa la prova di scrittura e salva. Poi premi **Ribilancia ora**.
+
+**Nome sbagliato?** Si sistema senza toccare cloudraid:
+- **nome dell'app:** Registrazioni app → la tua app → **Personalizzazione e proprietà** (*Branding & properties*) →
+  **Nome** → **Salva**. L'ID applicazione resta uguale, quindi non serve ricollegare niente;
+- **cartella in OneDrive:** non cambia nome da sola. Rinominala da onedrive.live.com, per esempio da `App/cloudrain` ad
+  `App/cloudraid`: Microsoft la riconosce dall'ID dell'app, non dal nome, quindi cloudraid continua a trovarla. Non
+  spostarla e non toccare i file che contiene.
+
+| Errore | Causa e rimedio |
+|---|---|
+| *"creating applications outside of a directory..."* durante la registrazione | manca una directory: vedi "Prima di cominciare" |
+| `AADSTS7000218` o "client_assertion or client_secret" | manca **Consenti flussi client pubblici: Sì** (punto 3) |
+| `AADSTS50020`, oppure "l'account non esiste nel tenant" | tra i tipi di account mancano gli "account Microsoft personali" (punto 2). Si cambia in **Manifesto** (`signInAudience` = `AzureADandPersonalMicrosoftAccount`) o rifacendo la registrazione |
+| accesso negato o 403 in scrittura | manca `Files.ReadWrite.AppFolder` (punto 4): aggiungilo e ricollega l'account |
 
 ### Google Drive
 

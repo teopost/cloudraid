@@ -74,6 +74,15 @@ impl Credentials {
         })
     }
 
+    /// Sposta le credenziali di un backend sotto un nome nuovo.
+    pub fn rename(&self, old: &str, new: &str) -> Result<()> {
+        self.update(|map| {
+            if let Some(entry) = map.remove(old) {
+                map.insert(new.to_string(), entry);
+            }
+        })
+    }
+
     pub fn remove(&self, backend: &str) -> Result<()> {
         self.update(|map| {
             map.remove(backend);

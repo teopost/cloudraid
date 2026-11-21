@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use crate::backend::oauth::{Link, LinkPrompt, LinkState, Provider};
-use crate::config::{BackendConfig, BackendKind};
+use crate::config::{valid_name, BackendConfig, BackendKind};
 use crate::crypto::{self, random_hex, KeyFile};
 use crate::setup::{self, NewBackend};
 use crate::repo::{normalize, ScrubReport, LOCK_STALE_SECS};
@@ -577,6 +577,29 @@ impl App {
                         return Ok((format!("{name} di nuovo in servizio: il ribilanciamento gli ridà una parte dei frammenti"), None));
                     }
                     Ok((repo.retire(&name, &mut |d, t| progress(d, t))?.summary(), None))
+                });
+                let _ = req.respond(r);
+            }
+            (Method::Post, "/api/backends/rename") => {
+                let (name, new_name) = match read_json(&mut req) {
+                    Ok(v) => {
+                        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+                        (s("name"), s("new_name"))
+                    }
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                if !valid_name(&new_name) {
+                    let _ = req.respond(error(400, "nome non valido: usa lettere minuscole, cifre, - e _ (al massimo 40 caratteri)"));
+                    return;
+                }
+                let config = self.opts.config.clone();
+                let r = self.start_job("rename-backend", format!("Rinomina di {name} in {new_name}"), move |repo, _| {
+                    repo.lock()?;
+                    setup::rename_backend(&config, repo, &name, &new_name)?;
+                    Ok((format!("{name} ora si chiama {new_name}"), None))
                 });
                 let _ = req.respond(r);
             }

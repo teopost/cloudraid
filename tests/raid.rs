@@ -25,6 +25,7 @@ impl Lab {
             transfers: 4,
             apps: AppsConfig::default(),
             dir: None,
+            file: None,
             backends: (0..backends)
                 .map(|i| {
                     let path = tmp.path().join(format!("acc{i}"));
@@ -562,17 +563,21 @@ fn pulizia_dei_frammenti_orfani() {
     let copy = lab.backend_dir((holder + 1) % 6).join(&key);
     fs::create_dir_all(copy.parent().unwrap()).unwrap();
     fs::copy(lab.backend_dir(holder).join(&key), &copy).unwrap();
+    // cartella vuota lasciata dalla prova delle versioni fino alla 0.9
+    let probe = lab.backend_dir(2).join("prova");
+    fs::create_dir_all(&probe).unwrap();
 
     repo.lock().unwrap();
     let dry = repo.gc(true, &mut |_, _| {}).unwrap();
     assert_eq!(dry.orphans, 3, "{dry:?}");
     assert_eq!(dry.deleted, 0);
-    assert!(orphan.exists() && tmp.exists() && copy.exists(), "la simulazione non cancella");
+    assert!(orphan.exists() && tmp.exists() && copy.exists() && probe.exists(), "la simulazione non cancella");
     let mut progress = Vec::new();
     let r = repo.gc(false, &mut |d, t| progress.push((d, t))).unwrap();
     assert_eq!((r.orphans, r.deleted, r.failed), (3, 3, 0));
     assert_eq!(progress.last(), Some(&(3, 3)));
     assert!(!orphan.exists() && !tmp.exists() && !copy.exists());
+    assert!(!probe.exists(), "la cartella della prova rimasta viene tolta");
     assert_eq!(repo.gc(true, &mut |_, _| {}).unwrap().orphans, 0);
     // i file sono intatti
     check_all(&lab, &repo, &samples);
@@ -772,4 +777,17 @@ fn dismissione_rifiutata_con_pochi_backend() {
     let err = repo.retire("acc1", &mut |_, _| {}).unwrap_err();
     assert!(format!("{err:#}").contains("aggiungi prima"), "{err:#}");
     assert!(repo.retired().is_empty());
+}
+
+#[test]
+fn prova_di_una_cartella_locale_senza_avanzi() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("disco");
+    let bc = BackendConfig { name: "disco".into(), kind: BackendKind::Local { path: root.clone() }, delay_ms: 0 };
+    let keys = std::sync::Arc::new(cloudraid::crypto::Keys::ephemeral());
+    let creds = cloudraid::credentials::Credentials::load(None, keys).unwrap();
+    let b = cloudraid::backend::open_one(&bc, &AppsConfig::default(), &creds);
+    cloudraid::backend::probe(b.as_ref()).unwrap();
+    assert!(root.is_dir(), "la cartella del repository resta");
+    assert!(!root.join(cloudraid::backend::PROBE_DIR).exists(), "la cartella della prova è stata tolta");
 }

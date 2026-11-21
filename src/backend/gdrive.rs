@@ -371,6 +371,24 @@ impl Backend for GDrive {
         Ok(())
     }
 
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        super::check_key(dir)?;
+        let Some(id) = self.dir_id(dir, false)? else { return Ok(()) };
+        let url = format!("{}/drive/v3/files/{id}", self.api);
+        self.call(
+            &format!("cancellazione della cartella {dir}"),
+            |token| (http::agent().delete(&url).set("Authorization", &format!("Bearer {token}")), None),
+            |r| match r.status() {
+                200 | 204 | 404 => Step::Done(()),
+                s => Step::Fail(anyhow!("risposta {s}: {}", http::body_text(r))),
+            },
+        )?;
+        let prefix = format!("{dir}/");
+        self.dirs.lock().unwrap().retain(|d, _| d != dir && !d.starts_with(&prefix));
+        self.files.lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
+        Ok(())
+    }
+
     fn list(&self, dir: &str) -> Result<Vec<String>> {
         super::check_key(dir)?;
         let Some(id) = self.dir_id(dir, false)? else { return Ok(Vec::new()) };

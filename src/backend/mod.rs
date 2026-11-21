@@ -46,7 +46,12 @@ pub trait Backend: Send + Sync {
     /// Tutti gli oggetti sotto `dir`, anche nelle sottocartelle, con la dimensione in byte.
     /// Comprende gli avanzi di scritture interrotte (file temporanei): servono alla pulizia.
     fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>>;
-    /// Tipo di backend, per l'interfaccia ("local", "rclone").
+    /// Toglie la cartella `dir` **con tutto il contenuto** (dove il servizio ha cartelle vere: per S3
+    /// non serve). Usata solo per la cartella della prova, che non contiene altro.
+    fn remove_dir(&self, _dir: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Tipo di backend, per l'interfaccia ("local", "webdav", "s3"...).
     fn kind(&self) -> &'static str;
     /// Dimentica la disponibilità memorizzata: alla prossima domanda si verifica di nuovo.
     fn refresh(&self) {}
@@ -104,11 +109,11 @@ pub fn probe(b: &dyn Backend) -> Result<()> {
     b.refresh();
     b.create().context("creazione della cartella del repository")?;
     b.refresh();
-    let key = format!("prova/{}", random_hex(8));
+    let key = format!("{PROBE_DIR}/{}", random_hex(8));
     let data = random_hex(64).into_bytes();
     b.put(&key, &data).context("scrittura di prova")?;
     let back = b.get(&key).context("lettura di prova")?;
-    let listed = b.list("prova").context("elenco di prova");
+    let listed = b.list(PROBE_DIR).context("elenco di prova");
     let deleted = b.delete(&key).context("cancellazione di prova");
     if back.as_deref() != Some(&data[..]) {
         bail!("il file di prova riletto non corrisponde a quello scritto");
@@ -120,8 +125,13 @@ pub fn probe(b: &dyn Backend) -> Result<()> {
     if b.get(&key)?.is_some() {
         bail!("il file di prova risulta ancora presente dopo la cancellazione");
     }
+    // la cartella della prova non deve restare sul servizio
+    b.remove_dir(PROBE_DIR).context("cancellazione della cartella di prova")?;
     Ok(())
 }
+
+/// Cartella usata solo dalla prova di un backend nuovo, cancellata alla fine.
+pub const PROBE_DIR: &str = "prova";
 
 /// Un backend rallentato apposta (`delay_ms` nella configurazione): per provare le letture con un
 /// account lento senza averne uno.
@@ -155,6 +165,9 @@ impl Backend for Slow {
     }
     fn list(&self, dir: &str) -> Result<Vec<String>> {
         self.inner.list(dir)
+    }
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        self.inner.remove_dir(dir)
     }
     fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>> {
         self.inner.list_all(dir)
@@ -249,6 +262,14 @@ impl Backend for Local {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("backend {}: cancellazione di {key}", self.name)),
+        }
+    }
+
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        match fs::remove_dir_all(self.path(dir)?) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("backend {}: cancellazione della cartella {dir}", self.name)),
         }
     }
 

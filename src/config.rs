@@ -24,6 +24,9 @@ pub struct Config {
     /// Cartella della configurazione: lì stanno anche la copia della chiave e le credenziali cifrate.
     #[serde(skip)]
     pub dir: Option<PathBuf>,
+    /// Il file da cui è stata letta: chi prende il lock la rilegge se nel frattempo è cambiata.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
 /// Dimensioni dei blocchi a lunghezza variabile (FastCDC), in byte.
@@ -164,6 +167,7 @@ impl Config {
             .with_context(|| format!("impossibile leggere la configurazione {}", path.display()))?;
         let mut cfg = Config::parse(&text).with_context(|| format!("configurazione {} non valida", path.display()))?;
         cfg.dir = Some(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf());
+        cfg.file = Some(path.to_path_buf());
         Ok(cfg)
     }
 

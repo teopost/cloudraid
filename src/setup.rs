@@ -173,6 +173,57 @@ pub fn remove_backend(config_path: &Path, repo: &mut Repo, name: &str) -> Result
     Ok(())
 }
 
+/// Cambia il nome di un backend: nella configurazione, nelle credenziali e nell'indice (i frammenti
+/// restano dove sono: sui servizi il nome non compare). Serve il lock del repository. Gli altri
+/// processi (mount, riga di comando) rileggono la configurazione quando prendono il lock.
+pub fn rename_backend(config_path: &Path, repo: &mut Repo, old: &str, new: &str) -> Result<()> {
+    if !valid_name(new) {
+        bail!("nome non valido: usa lettere minuscole, cifre, - e _ (al massimo 40 caratteri)");
+    }
+    if old == new {
+        return Ok(());
+    }
+    if !repo.config().backends.iter().any(|b| b.name == old) {
+        bail!("{old} non è nella configurazione");
+    }
+    if repo.config().backends.iter().any(|b| b.name == new) {
+        bail!("esiste già un backend che si chiama {new}");
+    }
+    if !repo.holds_lock() {
+        bail!("serve il lock del repository");
+    }
+    let set_name = |from: &str, to: &str| {
+        let (from, to) = (from.to_string(), to.to_string());
+        edit_config(config_path, move |doc| {
+            let arr = backends_mut(doc)?;
+            let t = arr
+                .iter_mut()
+                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(from.as_str()))
+                .ok_or_else(|| anyhow!("{from} non trovato nel file"))?;
+            t["name"] = value(to.as_str());
+            Ok(())
+        })
+    };
+    let creds = repo.credentials().clone();
+    let cfg = set_name(old, new)?;
+    creds.rename(old, new)?;
+    let result = (|| -> Result<()> {
+        repo.reconfigure(cfg)?;
+        repo.rename_backend_refs(old, new)?;
+        repo.save()
+    })();
+    if let Err(e) = result {
+        // si torna al nome vecchio: configurazione e credenziali di nuovo coerenti con l'indice
+        let back = set_name(new, old);
+        let _ = creds.rename(new, old);
+        if let Ok(cfg) = back {
+            let _ = repo.reconfigure(cfg);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Imposta (o, con stringa vuota, toglie) i valori della sezione `[apps]`.
 pub fn set_apps(config_path: &Path, repo: &mut Repo, values: &[(&str, &str)]) -> Result<()> {
     const KEYS: [&str; 4] = ["dropbox_app_key", "onedrive_client_id", "google_client_id", "google_client_secret"];

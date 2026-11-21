@@ -219,6 +219,11 @@ impl Backend for OneDrive {
         )
     }
 
+    fn remove_dir(&self, dir: &str) -> Result<()> {
+        // la cancellazione per percorso vale anche per le cartelle (con il contenuto)
+        self.delete(dir)
+    }
+
     fn list(&self, dir: &str) -> Result<Vec<String>> {
         super::check_key(dir)?;
         Ok(self.children(dir)?.unwrap_or_default().into_iter().filter(|(_, d, _)| !d).map(|(k, _, _)| k).collect())

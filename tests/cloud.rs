@@ -126,6 +126,10 @@ fn webdav_server(user: &'static str, pass: &'static str) -> String {
     dirs.lock().unwrap().insert("/dav".into());
     let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
     serve(move |r, _| {
+        // solo per i test: le cartelle che esistono
+        if r.path == "/__cartelle" {
+            return resp(200, dirs.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n"));
+        }
         if r.header("authorization") != Some(&auth) {
             return resp(401, "auth");
         }
@@ -149,6 +153,13 @@ fn webdav_server(user: &'static str, pass: &'static str) -> String {
                 Some(d) => resp(200, d.clone()),
                 None => resp(404, ""),
             },
+            // una cartella si cancella con tutto il contenuto, come sui server veri
+            "DELETE" if dirs.contains(&path) => {
+                let prefix = format!("{path}/");
+                dirs.retain(|d| *d != path && !d.starts_with(&prefix));
+                files.retain(|f, _| !f.starts_with(&prefix));
+                resp(204, "")
+            }
             "DELETE" => match files.remove(&path) {
                 Some(_) => resp(204, ""),
                 None => resp(404, ""),
@@ -277,7 +288,7 @@ impl OAuthState {
         let at = format!("AT{}", self.issued);
         self.access.push(at.clone());
         if self.rotate || self.refresh.is_empty() {
-            self.refresh = format!("RT{}", self.issued);
+            self.refresh = format!("refresh-finto-{}", self.issued);
         }
         json!({"access_token": at, "token_type": "bearer", "expires_in": 3600, "refresh_token": self.refresh})
     }
@@ -363,6 +374,9 @@ fn dropbox_server(oauth: Arc<Mutex<OAuthState>>) -> String {
     let files: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::default();
     let folders: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
     serve(move |r, _| {
+        if r.path == "/__cartelle" {
+            return resp(200, folders.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n"));
+        }
         if let Some(out) = oauth.lock().unwrap().handle(&r, None) {
             return out;
         }
@@ -376,6 +390,14 @@ fn dropbox_server(oauth: Arc<Mutex<OAuthState>>) -> String {
         match r.path.as_str() {
             "/2/files/upload" => {
                 assert_eq!(arg["mode"], "overwrite");
+                // come Dropbox: le cartelle che contengono il file nascono e restano anche quando si svuotano
+                let mut d = path.as_str();
+                while let Some((parent, _)) = d.rsplit_once('/') {
+                    if !parent.is_empty() {
+                        folders.lock().unwrap().insert(parent.to_string());
+                    }
+                    d = parent;
+                }
                 files.insert(path, r.body);
                 json_resp(200, json!({"name": "x"}))
             }
@@ -383,6 +405,12 @@ fn dropbox_server(oauth: Arc<Mutex<OAuthState>>) -> String {
                 Some(d) => resp(200, d.clone()),
                 None => not_found(),
             },
+            "/2/files/delete_v2" if folders.lock().unwrap().contains(&path) => {
+                let prefix = format!("{path}/");
+                folders.lock().unwrap().retain(|d| *d != path && !d.starts_with(&prefix));
+                files.retain(|f, _| !f.starts_with(&prefix));
+                json_resp(200, json!({}))
+            }
             "/2/files/delete_v2" => match files.remove(&path) {
                 Some(_) => json_resp(200, json!({})),
                 None => json_resp(409, json!({"error_summary": "path_lookup/not_found/"})),
@@ -563,6 +591,11 @@ fn gdrive_server(oauth: Arc<Mutex<OAuthState>>) -> String {
     let st: Arc<Mutex<DriveState>> = Arc::default();
     st.lock().unwrap().rate_limit = 2;
     serve(move |r, base| {
+        if r.path == "/__cartelle" {
+            let st = st.lock().unwrap();
+            let names: Vec<String> = st.items.values().filter(|it| it.folder).map(|it| it.name.clone()).collect();
+            return resp(200, names.join("\n"));
+        }
         if let Some(out) = oauth.lock().unwrap().handle(&r, Some("segreto-google")) {
             return out;
         }
@@ -775,7 +808,7 @@ fn repository_su_cinque_servizi_cloud() {
     assert!(cfg_text.contains("# prova"), "commenti conservati");
     assert!(cfg_text.contains("folder_id"), "cartella di Google registrata");
     let creds = fs::read(tmp.path().join("credenziali.bin")).unwrap();
-    for secret in ["pw-dav", "segreto-s3", "RT"] {
+    for secret in ["pw-dav", "segreto-s3", "refresh-finto"] {
         assert!(!cfg_text.contains(secret) && !String::from_utf8_lossy(&creds).contains(secret), "{secret} in chiaro");
     }
 
@@ -823,6 +856,42 @@ fn repository_su_cinque_servizi_cloud() {
     assert!(setup::remove_backend(&config_path, &mut repo, "gd").is_err());
     setup::remove_backend(&config_path, &mut repo, "loc3").unwrap();
     assert!(!fs::read_to_string(&config_path).unwrap().contains("loc3"));
+
+    // rinomina: un servizio con dati e token (od) e uno dismesso (loc1). Un secondo processo aperto
+    // prima (come il mount) prende i nomi nuovi quando prende il lock.
+    repo.unlock();
+    let mut other = Repo::open(Config::load(&config_path).unwrap(), PW).unwrap();
+    repo.lock().unwrap();
+    let od_shards = repo.status().into_iter().find(|b| b.name == "od").unwrap().shards;
+    assert!(od_shards > 0);
+    assert!(setup::rename_backend(&config_path, &mut repo, "od", "dav").is_err(), "nome già usato");
+    assert!(setup::rename_backend(&config_path, &mut repo, "od", "One Drive").is_err(), "nome non valido");
+    // config.toml riscritto nello stesso secondo: la data di modifica deve comunque cambiare
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    setup::rename_backend(&config_path, &mut repo, "od", "onedrive").unwrap();
+    setup::rename_backend(&config_path, &mut repo, "loc1", "vecchio").unwrap();
+    repo.unlock();
+    let cfg_text = fs::read_to_string(&config_path).unwrap();
+    assert!(cfg_text.contains("name = \"onedrive\"") && !cfg_text.contains("name = \"od\""), "{cfg_text}");
+    assert!(cfg_text.contains("# prova"), "commenti conservati");
+    assert!(repo.retired().contains("vecchio") && !repo.retired().contains("loc1"));
+    let st = repo.status();
+    assert_eq!(st.iter().find(|b| b.name == "onedrive").map(|b| b.shards), Some(od_shards), "{st:?}");
+    assert!(st.iter().all(|b| b.name != "od"));
+    assert!(repo.credentials().get("onedrive", "refresh_token").is_some());
+    assert!(repo.credentials().get("od", "refresh_token").is_none());
+    other.lock().unwrap();
+    assert!(other.config().backends.iter().any(|b| b.name == "onedrive"), "configurazione riletta prendendo il lock");
+    assert_eq!(other.status().iter().find(|b| b.name == "onedrive").map(|b| (b.available, b.shards)), Some((true, od_shards)));
+    other.unlock();
+    drop((repo, other));
+    // riaperto da zero: tutto leggibile, nessun frammento mancante
+    let mut repo = Repo::open(Config::load(&config_path).unwrap(), PW).unwrap();
+    let s = repo.scrub(false).unwrap();
+    assert_eq!((s.shards_missing, s.shards_corrupt), (0, 0), "{s:?}");
+    let out = tmp.path().join("out");
+    repo.get_file("grande.bin", &out, &mut ReadStats::default()).unwrap();
+    assert!(fs::read(&out).unwrap() == big);
 }
 
 #[test]
@@ -860,6 +929,7 @@ fn backend_singoli_operazioni_di_base() {
     };
     let (o1, o2, o3) = (Arc::new(Mutex::new(OAuthState::default())), Arc::new(Mutex::new(OAuthState::default())), Arc::new(Mutex::new(OAuthState::default())));
     let (dbx, od, gd) = (dropbox_server(o1.clone()), onedrive_server(o2.clone()), gdrive_server(o3.clone()));
+    let mock_base: HashMap<&str, String> = [("dav", dav.clone()), ("dbx", dbx.clone()), ("gd", gd.clone())].into();
     creds.set("dbx", "refresh_token", Some(&link(Provider::Dropbox, &dbx, &o1, &apps))).unwrap();
     creds.set("od", "refresh_token", Some(&link(Provider::OneDrive, &od, &o2, &apps))).unwrap();
     creds.set("gd", "refresh_token", Some(&link(Provider::Google, &gd, &o3, &apps))).unwrap();
@@ -876,6 +946,11 @@ fn backend_singoli_operazioni_di_base() {
         let b = open_one(bc, &apps, &creds);
         assert!(b.is_available() || bc.name != "gd", "{}", bc.name);
         probe(b.as_ref()).unwrap_or_else(|e| panic!("{}: {e:#}", bc.name));
+        // la prova non lascia la sua cartella (dove il servizio ha cartelle vere)
+        if let Some(base) = mock_base.get(bc.name.as_str()) {
+            let dirs = ureq::get(&format!("{base}/__cartelle")).call().unwrap().into_string().unwrap();
+            assert!(dirs.lines().all(|d| !d.ends_with("prova")), "{}: cartella di prova rimasta: {dirs}", bc.name);
+        }
         for i in 0..7 {
             b.put(&format!("data/ab/k{i}"), &random(&i.to_string(), 100 + i)).unwrap();
         }
