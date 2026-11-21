@@ -177,9 +177,21 @@ struct AppsView {
     gdrive: bool,
 }
 
+/// La cartella predefinita dei backend locali: accanto al mount del repository (/mnt/cloudraid/archivio),
+/// fuori da /srv/docker e quindi fuori dal backup orario.
+const DEFAULT_LOCAL_ROOT: &str = "/mnt/cloudraid/dischi";
+
 /// La cartella sotto cui l'interfaccia può creare backend locali (quella montata nel container).
 fn local_root() -> String {
-    std::env::var("CLOUDRAID_LOCAL_ROOT").unwrap_or_else(|_| "/srv/cloudraid".into())
+    std::env::var("CLOUDRAID_LOCAL_ROOT").unwrap_or_else(|_| DEFAULT_LOCAL_ROOT.into())
+}
+
+/// `path` sta dentro `root` (una sottocartella, mai la radice stessa, senza `.` o `..`).
+fn inside_root(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path.starts_with(&format!("{root}/"))
+        && !path.split('/').any(|p| p == ".." || p == ".")
+        && path.trim_end_matches('/').len() > root.len() + 1
 }
 
 /// Un collegamento di account in corso: il flusso OAuth e, a collegamento fatto, il token.
@@ -813,10 +825,7 @@ impl App {
             "local" => {
                 let root = local_root();
                 let path = s("path");
-                let ok = path.starts_with(&format!("{}/", root.trim_end_matches('/')))
-                    && !path.split('/').any(|p| p == ".." || p == ".")
-                    && path.len() > root.len() + 1;
-                if !ok {
+                if !inside_root(&root, &path) {
                     return error(400, format!("la cartella deve stare dentro {root}"));
                 }
                 BackendKind::Local { path: path.into() }
@@ -1042,5 +1051,25 @@ enum JobError {
 impl From<anyhow::Error> for JobError {
     fn from(e: anyhow::Error) -> Self {
         JobError::Plain(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cartelle_locali_solo_dentro_la_radice() {
+        let root = DEFAULT_LOCAL_ROOT;
+        assert_eq!(root, "/mnt/cloudraid/dischi");
+        assert!(inside_root(root, "/mnt/cloudraid/dischi/disco1"));
+        assert!(inside_root("/mnt/cloudraid/dischi/", "/mnt/cloudraid/dischi/usb/disco2"));
+        assert!(!inside_root(root, "/mnt/cloudraid/dischi"));
+        assert!(!inside_root(root, "/mnt/cloudraid/dischi/"));
+        assert!(!inside_root(root, "/mnt/cloudraid/dischi2/x"));
+        assert!(!inside_root(root, "/mnt/cloudraid/archivio/x"));
+        assert!(!inside_root(root, "/mnt/cloudraid/dischi/../archivio"));
+        assert!(!inside_root(root, "/mnt/cloudraid/dischi/./x"));
+        assert!(!inside_root(root, "/srv/cloudraid/disco1"));
     }
 }

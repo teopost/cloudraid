@@ -805,7 +805,7 @@ function renderWizard() {
     help: 'Solo lettere minuscole, cifre, - e _. Serve a riconoscerlo nell\'elenco.',
   });
   if (wiz.type === 'local') {
-    const root = (snap && snap.local_root) || '/srv/cloudraid';
+    const root = (snap && snap.local_root) || '/mnt/cloudraid/dischi';
     const name = wiz.values.name || suggestName('local');
     fields += field('path', 'Cartella', {
       value: `${root}/${name}`,

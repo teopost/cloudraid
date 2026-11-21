@@ -21,8 +21,9 @@ services:
     volumes:
       # cloudraid.toml (l'interfaccia la modifica), credenziali.bin (cifrate), cloudraid.key, web-state.json
       - ./config:/config
-      # backend locali: stesso percorso dentro e fuori dal container
-      - /srv/cloudraid:/srv/cloudraid
+      # backend locali (dischi): stesso percorso dentro e fuori dal container, fuori da /srv/docker
+      # (niente backup orario dei frammenti: la ridondanza è il RAID stesso)
+      - /mnt/cloudraid/dischi:/mnt/cloudraid/dischi
     networks: [proxy]
     # niente porte pubblicate: si passa solo da Traefik
     healthcheck:
@@ -40,8 +41,7 @@ services:
       - traefik.http.services.cloudraid.loadbalancer.server.port=8080
 
   mount:
-    # Il repository come cartella sull'host: ${CLOUDRAID_MOUNT_DIR}/archivio (predefinito
-    # /mnt/cloudraid/archivio), in lettura e scrittura (CLOUDRAID_MOUNT_RW=false per la sola lettura).
+    # Il repository come cartella sull'host: /mnt/cloudraid/archivio, in lettura e scrittura (CLOUDRAID_MOUNT_RW=false per la sola lettura).
     # Profilo "mount": si attiva con COMPOSE_PROFILES=mount in .env, e serve CLOUDRAID_PASSWORD in .env
     # perché all'avvio non c'è nessuno a digitarla. I file in scrittura passano in chiaro da /tmp del
     # container (sul disco di sistema) e vengono cancellati appena caricati.
@@ -68,12 +68,12 @@ services:
     security_opt: [apparmor=unconfined]
     volumes:
       - ./config:/config
-      - /srv/cloudraid:/srv/cloudraid
+      # i dischi locali (/mnt/cloudraid/dischi) arrivano con la cartella madre qui sotto
       # si monta la cartella madre con propagazione condivisa: il mount fatto nel container
       # compare sull'host, e se il processo morisse male un mount appeso in archivio/ non
       # impedirebbe al container di ripartire (lo smonta da solo all'avvio)
       - type: bind
-        source: ${CLOUDRAID_MOUNT_DIR:-/mnt/cloudraid}
+        source: /mnt/cloudraid
         target: /mnt/cloudraid
         bind:
           propagation: rshared
@@ -97,7 +97,7 @@ services:
       TZ: Europe/Rome
     volumes:
       - ./config:/config
-      - /srv/cloudraid:/srv/cloudraid
+      - /mnt/cloudraid/dischi:/mnt/cloudraid/dischi
 
 networks:
   proxy:

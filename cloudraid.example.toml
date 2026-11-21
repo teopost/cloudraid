@@ -27,14 +27,14 @@ parity_shards = 2
 [[backend]]
 name = "disco1"
 type = "local"
-path = "/srv/cloudraid/disco1"
+path = "/mnt/cloudraid/dischi/disco1"
 # solo per prove: ogni lettura da questo backend aspetta 1,5 s, come un account lento
 # delay_ms = 1500
 
 [[backend]]
 name = "disco2"
 type = "local"
-path = "/srv/cloudraid/disco2"
+path = "/mnt/cloudraid/dischi/disco2"
 
 # WebDAV (Nextcloud, ownCloud, NAS): l'indirizzo della cartella del repository.
 # Per Nextcloud: https://<server>/remote.php/dav/files/<utente>/cloudraid

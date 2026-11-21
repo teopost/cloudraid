@@ -170,7 +170,7 @@ editor, condivisione in rete.
 
 Nel compose c'è il servizio `mount`, facoltativo (profilo `mount`): metti in `.env` `COMPOSE_PROFILES=mount` e
 `CLOUDRAID_PASSWORD` (all'avvio nessuno può digitarla), poi `docker compose up -d`. Il repository compare sull'host
-in `/mnt/cloudraid/archivio` (`CLOUDRAID_MOUNT_DIR` cambia la cartella madre), in lettura e scrittura
+in `/mnt/cloudraid/archivio`, accanto ai dischi locali in `/mnt/cloudraid/dischi`, in lettura e scrittura
 (`CLOUDRAID_MOUNT_RW=false` per la sola lettura). Il container ha bisogno di `/dev/fuse`, del permesso `SYS_ADMIN`
 e di uscire dal profilo AppArmor `docker-default`, che vieta `mount`.
 Attenzione: `docker kill` è uno stop manuale, quindi il container non riparte da solo e lascia il mount appeso
@@ -179,7 +179,7 @@ finché non lanci `docker compose up -d`. Un crash vero, invece, fa ripartire il
 ## Installazione sul server (Docker)
 
 Il progetto sta in `/srv/docker/cloudraid`, come le altre app. L'immagine contiene solo cloudraid;
-`compose.yaml` monta la configurazione (`./config`) e i backend locali (`/srv/cloudraid`).
+`compose.yaml` monta la configurazione (`./config`) e i backend locali (`/mnt/cloudraid/dischi`, fuori dal backup orario di `/srv/docker`).
 cloudraid è un comando, non un servizio: si lancia con lo script `./cloudraid`, che monta anche la cartella corrente,
 così i percorsi relativi funzionano come con un programma installato.
 
@@ -197,7 +197,8 @@ docker compose up -d web                     # interfaccia web: https://<LAN_IP>
 Poi gli account cloud si aggiungono dall'interfaccia (Spazi), e le cartelle locali si possono dismettere.
 `init` crea il repository solo su backend che non chiedono credenziali (cartelle locali): le credenziali sono cifrate con
 la chiave del repository, che ancora non esiste. Le cartelle che l'interfaccia può creare devono stare dentro
-`/srv/cloudraid` (`CLOUDRAID_LOCAL_ROOT`), l'unica cartella dell'host montata nel container.
+`/mnt/cloudraid/dischi` (`CLOUDRAID_LOCAL_ROOT`), l'unica cartella dell'host per i dischi montata nel container.
+Per usare un altro disco fisico, montalo in una sottocartella (es. `/mnt/cloudraid/dischi/usb1`).
 
 Facoltativo: `CLOUDRAID_PASSWORD` in `.env` (`chmod 600`, modello in `.env.example`) per gli usi non interattivi,
 per esempio uno `scrub` periodico da cron.
