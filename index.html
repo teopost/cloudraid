@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cloudraid · un RAID tra i tuoi cloud</title>
+<meta name="description" content="cloudraid divide ogni file in pezzi cifrati e li distribuisce su più servizi cloud e dischi: puoi perderne due qualsiasi senza perdere niente. Self-hosted, scritto in Rust, senza dipendenze esterne.">
+<meta property="og:title" content="cloudraid · un RAID tra i tuoi cloud">
+<meta property="og:description" content="Backup cifrato e ridondante su Google Drive, OneDrive, Dropbox, WebDAV, S3 e dischi locali. Puoi perdere due spazi qualsiasi senza perdere niente.">
+<meta property="og:image" content="https://teopost.github.io/cloudraid/img/panoramica.png">
+<meta property="og:type" content="website">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<style>
+:root {
+  --bg: #f5f7f8; --bg-2: #ffffff; --text: #16202a; --muted: #586474; --border: #e2e7ec;
+  --accent: #0f766e; --accent-2: #14b8a6; --accent-soft: #e3f4f1; --shadow: 0 18px 50px -20px rgba(15, 40, 60, .28);
+  --hero-1: #0b3d3a; --hero-2: #0f766e; --hero-text: #f2fbfa; --code-bg: #0f1720; --code-text: #d7e3ee;
+  --radius: 18px;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0d1217; --bg-2: #141b22; --text: #e7edf3; --muted: #9aa8b6; --border: #26313c;
+    --accent: #2dd4bf; --accent-2: #5eead4; --accent-soft: #10302d; --shadow: 0 18px 50px -20px rgba(0, 0, 0, .7);
+    --hero-1: #062724; --hero-2: #0c4f49; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+img { max-width: 100%; height: auto; display: block; }
+a { color: var(--accent); }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 16px; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+
+/* barra */
+.nav { position: absolute; top: 0; left: 0; right: 0; z-index: 5; }
+.nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 72px; }
+.logo { display: flex; align-items: center; gap: .6rem; color: var(--hero-text); text-decoration: none; font-weight: 700; font-size: 1.15rem; }
+.logo img { width: 32px; height: 32px; }
+.nav-links { display: flex; gap: 1.4rem; align-items: center; }
+.nav-links a { color: rgba(242, 251, 250, .85); text-decoration: none; font-size: .95rem; }
+.nav-links a:hover { color: #fff; }
+.nav-links .gh { border: 1px solid rgba(255, 255, 255, .35); border-radius: 99px; padding: .35rem .9rem; }
+
+/* eroe */
+.hero { position: relative; overflow: hidden; color: var(--hero-text); background: radial-gradient(1200px 600px at 80% -10%, rgba(45, 212, 191, .35), transparent 60%), linear-gradient(160deg, var(--hero-1), var(--hero-2)); padding: 130px 0 110px; }
+.hero::after { content: ""; position: absolute; inset: auto 0 0 0; height: 160px; background: linear-gradient(transparent, var(--bg)); }
+.hero-grid { position: relative; z-index: 1; display: grid; gap: 2.5rem; }
+.eyebrow { display: inline-flex; gap: .5rem; align-items: center; background: rgba(255, 255, 255, .12); border: 1px solid rgba(255, 255, 255, .2); border-radius: 99px; padding: .3rem .85rem; font-size: .85rem; }
+.eyebrow b { color: #99f6e4; }
+.hero h1 { font-size: clamp(2.3rem, 5.4vw, 4.1rem); line-height: 1.05; letter-spacing: -.035em; margin: 1.1rem 0 1rem; max-width: 15ch; }
+.hero h1 span { background: linear-gradient(90deg, #99f6e4, #5eead4 40%, #ccfbf1); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p.lead { font-size: clamp(1.05rem, 2vw, 1.25rem); max-width: 40rem; color: rgba(242, 251, 250, .88); margin: 0 0 1.8rem; }
+.cta { display: flex; flex-wrap: wrap; gap: .8rem; }
+.btn { display: inline-flex; align-items: center; gap: .5rem; padding: .85rem 1.35rem; border-radius: 12px; font-weight: 650; text-decoration: none; transition: transform .15s ease, box-shadow .15s ease; }
+.btn:hover { transform: translateY(-1px); }
+.btn-primary { background: #f0fdfa; color: #0b3d3a; box-shadow: 0 10px 30px -10px rgba(0, 0, 0, .45); }
+.btn-ghost { color: #f0fdfa; border: 1px solid rgba(255, 255, 255, .35); }
+.shot { border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); border: 1px solid var(--border); background: var(--bg-2); }
+.browser { border-radius: 16px; overflow: hidden; box-shadow: 0 40px 90px -30px rgba(0, 0, 0, .55); border: 1px solid rgba(255, 255, 255, .18); background: #fff; }
+.browser-bar { display: flex; gap: 7px; align-items: center; padding: 10px 14px; background: #e9eef2; }
+.browser-bar i { width: 11px; height: 11px; border-radius: 50%; background: #f87171; display: block; }
+.browser-bar i:nth-child(2) { background: #fbbf24; } .browser-bar i:nth-child(3) { background: #34d399; }
+.browser-bar span { margin-left: 10px; font-size: .75rem; color: #6b7785; background: #fff; border-radius: 6px; padding: 2px 10px; }
+.hero-shot { position: relative; z-index: 1; margin-top: 3.2rem; }
+
+/* sezioni */
+section { padding: 88px 0; }
+.kicker { color: var(--accent); font-weight: 700; letter-spacing: .08em; text-transform: uppercase; font-size: .8rem; }
+h2 { font-size: clamp(1.8rem, 3.6vw, 2.6rem); letter-spacing: -.03em; line-height: 1.15; margin: .4rem 0 1rem; }
+.sub { color: var(--muted); font-size: 1.1rem; max-width: 44rem; margin: 0 0 2.5rem; }
+
+/* come funziona */
+.how { display: grid; gap: 2rem; align-items: center; }
+.diagram { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; box-shadow: var(--shadow); }
+.diagram svg { width: 100%; height: auto; }
+.diagram text { font-family: inherit; fill: var(--text); }
+.steps { display: grid; gap: 1.1rem; margin: 0; padding: 0; list-style: none; counter-reset: s; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 40px 1fr; gap: .9rem; align-items: start; }
+.steps li::before { content: counter(s); display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--accent-soft); color: var(--accent); font-weight: 800; }
+.steps b { display: block; }
+.steps span { color: var(--muted); }
+
+/* caratteristiche */
+.features { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+.card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; transition: transform .2s ease, box-shadow .2s ease; }
+.card:hover { transform: translateY(-3px); box-shadow: var(--shadow); }
+.ico { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); margin-bottom: .9rem; }
+.ico svg { width: 24px; height: 24px; }
+.card h3 { margin: 0 0 .35rem; font-size: 1.08rem; }
+.card p { margin: 0; color: var(--muted); font-size: .96rem; }
+
+/* servizi */
+.services { display: flex; flex-wrap: wrap; gap: .7rem; }
+.svc { display: inline-flex; align-items: center; gap: .55rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 99px; padding: .55rem 1rem .55rem .7rem; font-weight: 600; }
+.svc i { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; color: #fff; font-style: normal; font-size: .72rem; font-weight: 800; }
+.note { color: var(--muted); font-size: .92rem; margin-top: 1rem; }
+
+/* galleria */
+.gallery { display: grid; gap: 1.4rem; }
+.gallery figure { margin: 0; }
+.gallery figcaption { color: var(--muted); font-size: .92rem; margin-top: .6rem; }
+.gallery .row { display: grid; gap: 1.4rem; }
+.phone { max-width: 300px; margin: 0 auto; border-radius: 34px; overflow: hidden; border: 8px solid #111; box-shadow: var(--shadow); }
+
+/* numeri */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1rem; margin-top: 2.5rem; }
+.stat { text-align: center; padding: 18px; border-radius: var(--radius); background: var(--bg-2); border: 1px solid var(--border); }
+.stat b { display: block; font-size: 2rem; letter-spacing: -.03em; color: var(--accent); }
+.stat span { color: var(--muted); font-size: .9rem; }
+
+/* installazione */
+pre { background: var(--code-bg); color: var(--code-text); border-radius: 14px; padding: 20px 22px; overflow-x: auto; font-size: .88rem; line-height: 1.65; margin: 0; border: 1px solid #1f2a36; }
+pre .c { color: #7f93a7; }
+.install { display: grid; gap: 1.5rem; align-items: start; }
+
+/* domande */
+details { background: var(--bg-2); border: 1px solid var(--border); border-radius: 14px; padding: 16px 20px; margin-bottom: .7rem; }
+summary { cursor: pointer; font-weight: 650; }
+details p { color: var(--muted); margin: .7rem 0 0; }
+
+footer { border-top: 1px solid var(--border); padding: 36px 0 50px; color: var(--muted); font-size: .92rem; }
+footer .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; }
+
+@media (min-width: 900px) {
+  .hero-grid { grid-template-columns: 1.05fr .95fr; align-items: center; }
+  .how { grid-template-columns: 1.1fr .9fr; }
+  .gallery .row { grid-template-columns: 1fr 1fr; }
+  .gallery .row.wide { grid-template-columns: 1.7fr 1fr; align-items: center; }
+  .install { grid-template-columns: .8fr 1.2fr; }
+}
+@media (max-width: 640px) {
+  .nav-links a:not(.gh) { display: none; }
+  section { padding: 64px 0; }
+  .hero { padding-top: 104px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="logo" href="#"><img src="img/favicon.svg" alt="">cloudraid</a>
+    <nav class="nav-links" aria-label="Sezioni">
+      <a href="#come-funziona">Come funziona</a>
+      <a href="#caratteristiche">Caratteristiche</a>
+      <a href="#schermate">Schermate</a>
+      <a href="#installazione">Installazione</a>
+      <a class="gh" href="https://github.com/teopost/cloudraid">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <span class="eyebrow"><b>●</b> Self-hosted · Rust · nessuna dipendenza esterna</span>
+        <h1>Un RAID tra i tuoi <span>cloud</span>.</h1>
+        <p class="lead">cloudraid cifra ogni file, lo divide in sei pezzi e li sparge su Google Drive, OneDrive, Dropbox,
+          Nextcloud, S3 e i tuoi dischi. Ne bastano quattro per ricostruirlo: puoi perdere <b>due spazi qualsiasi</b>
+          (un account chiuso, un disco rotto, un servizio che sparisce) senza perdere niente.</p>
+        <div class="cta">
+          <a class="btn btn-primary" href="#installazione">Installalo sul tuo server</a>
+          <a class="btn btn-ghost" href="#come-funziona">Come funziona</a>
+        </div>
+      </div>
+      <div class="browser hero-shot">
+        <div class="browser-bar"><i></i><i></i><i></i><span>cloudraid · panoramica</span></div>
+        <img src="img/panoramica.png" alt="La panoramica di cloudraid: spazio come un unico disco e stato dei sette spazi" width="2720" height="1720">
+      </div>
+    </div>
+  </div>
+</div>
+
+<section id="come-funziona">
+  <div class="wrap how">
+    <div class="diagram" aria-label="Schema: un file cifrato diviso in sei pezzi su sei spazi diversi">
+      <svg viewBox="0 0 560 360" role="img">
+        <defs>
+          <linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#14b8a6"/><stop offset="1" stop-color="#0f766e"/></linearGradient>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#14b8a6"/></marker>
+        </defs>
+        <rect x="20" y="140" width="120" height="80" rx="14" fill="url(#g)"/>
+        <text x="80" y="176" text-anchor="middle" font-size="15" font-weight="700" style="fill:#fff">Vacanze.zip</text>
+        <text x="80" y="198" text-anchor="middle" font-size="12" style="fill:#ccfbf1">cifrato</text>
+        <g stroke="#14b8a6" stroke-width="2" fill="none" marker-end="url(#a)">
+          <path d="M140 180 C 220 180, 220 40, 300 40"/>
+          <path d="M140 180 C 220 180, 220 96, 300 96"/>
+          <path d="M140 180 C 220 180, 220 152, 300 152"/>
+          <path d="M140 180 C 220 180, 220 208, 300 208"/>
+          <path d="M140 180 C 220 180, 220 264, 300 264" stroke-dasharray="5 5"/>
+          <path d="M140 180 C 220 180, 220 320, 300 320" stroke-dasharray="5 5"/>
+        </g>
+        <g font-size="13" font-weight="650">
+          <rect x="304" y="22" width="236" height="36" rx="10" fill="#4285f4"/><text x="320" y="45" style="fill:#fff">pezzo 1 · Google Drive</text>
+          <rect x="304" y="78" width="236" height="36" rx="10" fill="#0a64d8"/><text x="320" y="101" style="fill:#fff">pezzo 2 · OneDrive</text>
+          <rect x="304" y="134" width="236" height="36" rx="10" fill="#0061fe"/><text x="320" y="157" style="fill:#fff">pezzo 3 · Dropbox</text>
+          <rect x="304" y="190" width="236" height="36" rx="10" fill="#475569"/><text x="320" y="213" style="fill:#fff">pezzo 4 · disco di casa</text>
+          <rect x="304" y="246" width="236" height="36" rx="10" fill="#e11d48"/><text x="320" y="269" style="fill:#fff">parità 1 · Backblaze B2</text>
+          <rect x="304" y="302" width="236" height="36" rx="10" fill="#0e7490"/><text x="320" y="325" style="fill:#fff">parità 2 · Nextcloud / Koofr</text>
+        </g>
+        <text x="20" y="262" font-size="13" style="fill:var(--muted)">4 pezzi qualsiasi</text>
+        <text x="20" y="280" font-size="13" style="fill:var(--muted)">ricostruiscono il file</text>
+      </svg>
+    </div>
+    <div>
+      <div class="kicker">Come funziona</div>
+      <h2>Ridondanza vera, senza fidarti di nessun cloud.</h2>
+      <ol class="steps">
+        <li><div><b>Cifra</b><span>Ogni blocco è cifrato con XChaCha20-Poly1305 prima di uscire dal tuo server. La chiave si apre con la tua password (Argon2id) e non lascia mai casa.</span></div></li>
+        <li><div><b>Divide</b><span>Reed-Solomon trasforma ogni blocco in 4 pezzi di dati e 2 di parità, come un RAID 6 fatto di servizi cloud.</span></div></li>
+        <li><div><b>Distribuisce</b><span>Ogni pezzo va su uno spazio diverso, scegliendo quelli con più posto libero. I servizi vedono solo frammenti illeggibili.</span></div></li>
+        <li><div><b>Ricostruisce</b><span>In lettura bastano i 4 pezzi più veloci da scaricare. Se uno spazio sparisce, la verifica ricostruisce i pezzi mancanti altrove.</span></div></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="caratteristiche" style="padding-top:0">
+  <div class="wrap">
+    <div class="kicker">Caratteristiche</div>
+    <h2>Tutto quello che serve, in un solo programma.</h2>
+    <p class="sub">Un unico binario Rust: parla direttamente con i servizi cloud, senza rclone né altri programmi. Si installa con Docker in pochi minuti.</p>
+    <div class="features">
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg></div>
+        <h3>Cifrato da capo a fondo</h3><p>XChaCha20-Poly1305, chiave protetta da Argon2id, impronte BLAKE3 su ogni pezzo. Le credenziali dei servizi sono cifrate anche loro.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg></div>
+        <h3>Due spazi persi, zero dati persi</h3><p>Schema 4 + 2 con Reed-Solomon: si perdono due spazi qualsiasi. E mai più di due pezzi di un blocco sullo stesso disco fisico.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="12" width="4" height="9" rx="1"/><rect x="10" y="7" width="4" height="14" rx="1"/><rect x="17" y="3" width="4" height="18" rx="1"/></svg></div>
+        <h3>Spazi grandi e piccoli insieme</h3><p>Legge lo spazio libero di ogni servizio e mette i pezzi dove c'è posto: 2 GB di Dropbox e 1 TB di OneDrive lavorano insieme.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></div>
+        <h3>Una cartella come le altre</h3><p>Il repository si monta con FUSE: copi i file con <code>cp</code> o <code>rsync</code> e cloudraid li cifra, divide e distribuisce in automatico.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg></div>
+        <h3>Interfaccia web per tutti</h3><p>Panoramica, file, spazi e manutenzione in italiano. Aggiungere Google Drive o Dropbox è una procedura guidata, anche dal telefono.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+        <h3>Letture "a gara"</h3><p>Misura la velocità di ogni servizio e scarica i pezzi dai più rapidi; se uno rallenta, chiede un pezzo in più a un altro.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg></div>
+        <h3>Si ripara da solo</h3><p>Verifica dei pezzi, riparazione dalla parità, ribilanciamento, dismissione di un account senza perdere ridondanza, pulizia degli orfani.</p></div>
+      <div class="card"><div class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></div>
+        <h3>Deduplicazione</h3><p>Blocchi a lunghezza variabile (FastCDC): i contenuti uguali si salvano una volta sola, anche fra file diversi.</p></div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>4 + 2</b><span>pezzi per blocco</span></div>
+      <div class="stat"><b>2</b><span>spazi persi senza danni</span></div>
+      <div class="stat"><b>6</b><span>tipi di spazio supportati</span></div>
+      <div class="stat"><b>1</b><span>binario, zero dipendenze</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="servizi" style="padding-top:0">
+  <div class="wrap">
+    <div class="kicker">Dove salva</div>
+    <h2>I tuoi account, i tuoi dischi.</h2>
+    <p class="sub">Ogni servizio con il suo protocollo nativo, implementato in cloudraid. I piani gratuiti si sommano: con qualche account gratis hai già decine di GB protetti.</p>
+    <div class="services">
+      <span class="svc"><i style="background:#4285f4">G</i>Google Drive</span>
+      <span class="svc"><i style="background:#0a64d8">O</i>OneDrive</span>
+      <span class="svc"><i style="background:#0061fe">D</i>Dropbox</span>
+      <span class="svc"><i style="background:#0e7490">W</i>Nextcloud · Koofr · WebDAV</span>
+      <span class="svc"><i style="background:#e11d48">S3</i>Backblaze B2 e compatibili S3</span>
+      <span class="svc"><i style="background:#475569">⌂</i>Dischi e NAS locali</span>
+    </div>
+    <p class="note">Con Google Drive cloudraid usa solo l'autorizzazione <code>drive.file</code>: vede soltanto i file che crea lui. Con Dropbox e OneDrive, solo la propria cartella dell'app.</p>
+  </div>
+</section>
+
+<section id="schermate" style="padding-top:0">
+  <div class="wrap">
+    <div class="kicker">Schermate</div>
+    <h2>Semplice da usare, anche per chi non è un tecnico.</h2>
+    <p class="sub">Schermate dell'interfaccia vera, con dati dimostrativi.</p>
+    <div class="gallery">
+      <div class="row">
+        <figure><div class="shot"><img loading="lazy" src="img/aggiungi.png" alt="Procedura guidata per aggiungere uno spazio" width="2720" height="1720"></div>
+          <figcaption>Aggiungere uno spazio: si sceglie il servizio, si collega l'account, cloudraid prova tutto prima di salvare.</figcaption></figure>
+        <figure><div class="shot"><img loading="lazy" src="img/stato.png" alt="Badge di stato e dettagli della ridondanza" width="2720" height="1720"></div>
+          <figcaption>Un badge in alto dice se è tutto a posto; un clic per i dettagli e cosa fare.</figcaption></figure>
+      </div>
+      <div class="row wide">
+        <figure><div class="shot"><img loading="lazy" src="img/panoramica-scura.png" alt="Panoramica in tema scuro" width="2720" height="1720"></div>
+          <figcaption>Tema scuro automatico. Lo spazio di tutti i servizi visto come un unico disco.</figcaption></figure>
+        <figure><div class="phone"><img loading="lazy" src="img/telefono.png" alt="cloudraid sul telefono" width="1170" height="2532"></div>
+          <figcaption style="text-align:center">Anche dal telefono.</figcaption></figure>
+      </div>
+      <div class="row">
+        <figure><div class="shot"><img loading="lazy" src="img/file.png" alt="Elenco dei file" width="2720" height="1720"></div>
+          <figcaption>Sfoglia, cerca, carica trascinando, scarica: ogni file si ricostruisce e decifra al volo.</figcaption></figure>
+        <figure><div class="shot"><img loading="lazy" src="img/spazi.png" alt="Pagina degli spazi con spazio allocato" width="2720" height="1720"></div>
+          <figcaption>Per ogni spazio: quanto usa, quanto ne hai allocato, quanto dichiara il servizio.</figcaption></figure>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="installazione" style="padding-top:0">
+  <div class="wrap install">
+    <div>
+      <div class="kicker">Installazione</div>
+      <h2>Sul tuo server, in cinque minuti.</h2>
+      <p class="sub" style="margin-bottom:1rem">Serve un server Linux con Docker. Si parte con due cartelle locali e si aggiungono gli account cloud dall'interfaccia web.</p>
+      <p class="note">Le istruzioni passo passo per ogni servizio, comprese le quote gratuite, sono nella <a href="https://github.com/teopost/cloudraid/blob/main/docs/servizi.md">guida ai servizi</a>.</p>
+    </div>
+    <pre><code><span class="c"># scarica e costruisci</span>
+git clone https://github.com/teopost/cloudraid.git
+cd cloudraid && make build
+
+<span class="c"># configurazione di partenza</span>
+cp .env.example .env
+install -d -m 700 config
+cp cloudraid.example.toml config/cloudraid.toml
+
+<span class="c"># crea il repository (chiede la password) e avvia l'interfaccia</span>
+./cloudraid init
+docker compose up -d web
+
+<span class="c"># poi: https://&lt;server&gt;/cloudraid/  →  Spazi  →  Aggiungi uno spazio</span></code></pre>
+  </div>
+</section>
+
+<section id="domande" style="padding-top:0">
+  <div class="wrap">
+    <div class="kicker">Domande</div>
+    <h2>Domande frequenti</h2>
+    <details><summary>I servizi cloud possono leggere i miei file?</summary><p>No. Ricevono solo pezzi cifrati, e di norma ogni servizio ha un solo pezzo di ogni blocco. Senza la chiave, che resta sul tuo server protetta dalla tua password, sono dati illeggibili.</p></details>
+    <details><summary>Cosa succede se un servizio chiude il mio account?</summary><p>Niente di grave: i file si leggono dagli altri spazi. Aggiungi un nuovo spazio, premi "Verifica e ripara" e i pezzi mancanti vengono ricostruiti dalla parità e salvati lì.</p></details>
+    <details><summary>Posso mescolare spazi di dimensioni diverse?</summary><p>Sì. cloudraid legge lo spazio libero di ogni servizio (o quello che allochi tu) e distribuisce i pezzi di conseguenza. La panoramica mostra quanto puoi ancora caricare, già al netto della ridondanza.</p></details>
+    <details><summary>Sostituisce il backup?</summary><p>È un archivio ridondante, non un backup con versioni: se cancelli un file, è cancellato ovunque. Ha senso affiancarlo a un backup tradizionale, oppure usarlo come destinazione dei backup.</p></details>
+    <details><summary>Di cosa ha bisogno per funzionare?</summary><p>Di un server Linux con Docker (anche un mini PC), di almeno sei spazi (cartelle, dischi o account cloud) e, per Google, Microsoft e Dropbox, di registrare l'app una volta sola presso il servizio: l'interfaccia ti guida passo passo.</p></details>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>cloudraid · progetto personale, scritto in Rust.</span>
+    <span><a href="https://github.com/teopost/cloudraid">Codice su GitHub</a> · <a href="https://github.com/teopost/cloudraid/blob/main/README.md">Documentazione</a></span>
+  </div>
+</footer>
+</body>
+</html>
