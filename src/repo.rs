@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,10 +40,27 @@ pub struct Repo {
     /// Frammenti da cancellare dopo il prossimo salvataggio riuscito dell'indice:
     /// cancellarli prima lascerebbe l'indice vecchio con riferimenti a dati spariti.
     pending_deletes: Vec<(String, String)>,
-    /// Il lock che teniamo, e quando l'abbiamo rinnovato.
-    lock: Option<(LockInfo, u64)>,
+    /// Il lock che teniamo, e quando l'abbiamo rinnovato (Mutex: si rinnova anche da `upload`, con &self).
+    lock: Mutex<Option<(LockInfo, u64)>>,
     /// Backend su cui abbiamo già controllato che ci sia `cloudraid.key`.
     keyfile_checked: HashSet<String>,
+}
+
+/// Un file caricato con `upload` ma non ancora registrato nell'indice.
+pub struct Upload {
+    pub size: u64,
+    pub hash: String,
+    pub mtime: Option<i64>,
+    pub chunks: Vec<String>,
+    /// Blocchi scritti adesso (gli altri c'erano già).
+    pub new: Vec<(String, ChunkEntry)>,
+}
+
+impl Upload {
+    /// Un file vuoto: niente da caricare.
+    pub fn empty(mtime: Option<i64>) -> Upload {
+        Upload { size: 0, hash: blake3::hash(b"").to_hex().to_string(), mtime, chunks: Vec::new(), new: Vec::new() }
+    }
 }
 
 /// Statistiche di lettura.
@@ -164,7 +182,7 @@ impl Repo {
             index: Index::default(),
             dirty: true,
             pending_deletes: Vec::new(),
-            lock: None,
+            lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
         };
         repo.save()?;
@@ -204,7 +222,7 @@ impl Repo {
             index,
             dirty: false,
             pending_deletes: Vec::new(),
-            lock: None,
+            lock: Mutex::new(None),
             keyfile_checked: HashSet::new(),
         })
     }
@@ -299,7 +317,7 @@ impl Repo {
 
     /// I lock presenti sul repository (anche scaduti), il nostro escluso.
     pub fn locks(&self) -> Vec<LockInfo> {
-        let mine = self.lock.as_ref().map(|(l, _)| l.id.clone());
+        let mine = self.lock.lock().unwrap().as_ref().map(|(l, _)| l.id.clone());
         self.read_locks().into_iter().filter(|l| Some(&l.id) != mine.as_ref()).collect()
     }
 
@@ -328,7 +346,7 @@ impl Repo {
 
     /// Prende il lock esclusivo. Fallisce se un altro processo lo tiene (e non è scaduto).
     pub fn lock(&mut self) -> Result<()> {
-        if self.lock.is_some() {
+        if self.holds_lock() {
             return Ok(());
         }
         let busy = |locks: Vec<LockInfo>, mine: &str| {
@@ -353,7 +371,7 @@ impl Repo {
             bail!("{}", describe(&other));
         }
         let t = mine.time;
-        self.lock = Some((mine, t));
+        *self.lock.lock().unwrap() = Some((mine, t));
         // chi prende il lock lavora sull'indice più recente: un altro processo potrebbe averlo
         // cambiato dopo la nostra apertura (si eviterebbe di sovrascrivere le sue modifiche)
         if !self.dirty {
@@ -367,24 +385,42 @@ impl Repo {
     }
 
     /// Rinnova il lock se è passato abbastanza tempo; chiamato durante le operazioni lunghe.
-    fn refresh_lock(&mut self) {
-        let Some((lock, refreshed)) = &self.lock else { return };
-        if now().saturating_sub(*refreshed) < LOCK_REFRESH_SECS {
-            return;
-        }
-        let mut lock = lock.clone();
+    pub fn refresh_lock(&self) {
+        let mut lock = {
+            let held = self.lock.lock().unwrap();
+            let Some((lock, refreshed)) = held.as_ref() else { return };
+            if now().saturating_sub(*refreshed) < LOCK_REFRESH_SECS {
+                return;
+            }
+            lock.clone()
+        };
         lock.time = now();
         match self.write_lock(&lock) {
             Ok(()) => {
                 let t = lock.time;
-                self.lock = Some((lock, t));
+                let mut held = self.lock.lock().unwrap();
+                // nel frattempo potrebbe essere stato rilasciato
+                if held.as_ref().is_some_and(|(l, _)| l.id == lock.id) {
+                    *held = Some((lock, t));
+                }
             }
             Err(e) => eprintln!("attenzione: rinnovo del lock: {e:#}"),
         }
     }
 
+    /// Teniamo il lock?
+    pub fn holds_lock(&self) -> bool {
+        self.lock.lock().unwrap().is_some()
+    }
+
+    /// Ci sono modifiche all'indice non ancora salvate?
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     pub fn unlock(&mut self) {
-        if let Some((lock, _)) = self.lock.take() {
+        let taken = self.lock.lock().unwrap().take();
+        if let Some((lock, _)) = taken {
             self.delete_lock(&lock.id);
         }
     }
@@ -485,50 +521,69 @@ impl Repo {
 
     /// Carica un file locale nel repository come `dest`. Restituisce i blocchi nuovi scritti.
     pub fn put_file(&mut self, src: &Path, dest: &str) -> Result<u64> {
+        let dest = self.check_file_dest(dest)?;
+        let up = self.upload(src, None)?;
+        let new_chunks = up.new.len() as u64;
+        self.commit_upload(&dest, up)?;
+        Ok(new_chunks)
+    }
+
+    /// `dest` normalizzato, se lì può stare un file (non la radice, non una cartella).
+    fn check_file_dest(&self, dest: &str) -> Result<String> {
         let dest = normalize(dest)?;
         if dest.is_empty() {
             bail!("percorso di destinazione vuoto");
         }
-        if self.index.files.keys().any(|f| f.starts_with(&format!("{dest}/"))) {
+        if self.is_dir(&dest) {
             bail!("{dest} è una cartella nel repository");
         }
+        Ok(dest)
+    }
+
+    /// Spezza `src` in blocchi e scrive quelli che il repository non ha ancora, senza toccare
+    /// l'indice: il risultato si registra con `commit_upload`. Va chiamata tenendo il lock
+    /// (`lock`), così nessun altro processo scrive gli stessi blocchi nello stesso momento.
+    /// `mtime` sostituisce la data del file sorgente. In caso di errore i frammenti già scritti
+    /// vengono cancellati.
+    pub fn upload(&self, src: &Path, mtime: Option<i64>) -> Result<Upload> {
         let file = fs::File::open(src).with_context(|| format!("impossibile aprire {}", src.display()))?;
-        let mtime = file
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
+        let mtime = mtime.or_else(|| {
+            file.metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        });
 
         let c = self.cfg.chunk;
         let mut cdc = fastcdc::v2020::StreamCDC::new(file, c.min, c.avg, c.max);
         let mut hasher = blake3::Hasher::new();
-        let mut chunks: Vec<String> = Vec::new();
-        let mut size = 0u64;
-        let mut new_chunks = 0u64;
+        let mut up = Upload { size: 0, hash: String::new(), mtime, chunks: Vec::new(), new: Vec::new() };
+        let mut stored: HashSet<String> = HashSet::new();
         let result: Result<()> = (|| loop {
             // un gruppo di `transfers` blocchi alla volta
             let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
             for chunk in cdc.by_ref().take(self.cfg.transfers) {
                 let chunk = chunk.map_err(|e| anyhow!("lettura di {}: {e}", src.display()))?;
                 hasher.update(&chunk.data);
-                size += chunk.length as u64;
+                up.size += chunk.length as u64;
                 batch.push((self.keys.chunk_id(&chunk.data), chunk.data));
             }
             if batch.is_empty() {
                 return Ok(());
             }
             let mut seen = HashSet::new();
-            let to_store: Vec<&(String, Vec<u8>)> =
-                batch.iter().filter(|(id, _)| !self.index.chunks.contains_key(id) && seen.insert(id.clone())).collect();
-            let stored = parallel(&to_store, |(id, data)| self.store_chunk(id, data));
+            let to_store: Vec<&(String, Vec<u8>)> = batch
+                .iter()
+                .filter(|(id, _)| !self.index.chunks.contains_key(id) && !stored.contains(id) && seen.insert(id.clone()))
+                .collect();
+            let results = parallel(&to_store, |(id, data)| self.store_chunk(id, data));
             let mut first_error = None;
-            for (item, res) in to_store.iter().zip(stored) {
+            for (item, res) in to_store.iter().zip(results) {
                 match res {
-                    // refs a 0: li incrementa il ciclo qui sotto, o li libera la pulizia in caso di errore
                     Ok(entry) => {
-                        self.index.chunks.insert(item.0.clone(), entry);
-                        new_chunks += 1;
+                        stored.insert(item.0.clone());
+                        up.new.push((item.0.clone(), entry));
                     }
                     Err(e) => {
                         first_error.get_or_insert(e);
@@ -538,30 +593,174 @@ impl Repo {
             if let Some(e) = first_error {
                 return Err(e);
             }
-            for (id, _) in batch {
-                self.index.chunks.get_mut(&id).expect("blocco appena salvato").refs += 1;
-                chunks.push(id);
-            }
-            self.dirty = true;
+            up.chunks.extend(batch.into_iter().map(|(id, _)| id));
             self.refresh_lock();
         })();
         if let Err(e) = result {
-            // annulla i riferimenti già presi e libera i blocchi scritti ma non usati
-            self.release(&chunks);
-            let orphans: Vec<String> =
-                self.index.chunks.iter().filter(|(_, c)| c.refs == 0).map(|(id, _)| id.clone()).collect();
-            for id in orphans {
-                self.forget_chunk(&id);
-            }
+            self.delete_shards(&up.new);
             return Err(e);
         }
+        up.hash = hasher.finalize().to_hex().to_string();
+        Ok(up)
+    }
 
-        let entry = FileEntry { size, hash: hasher.finalize().to_hex().to_string(), mtime, chunks };
-        if let Some(old) = self.index.files.insert(dest, entry) {
+    /// Cancella subito i frammenti di blocchi mai entrati nell'indice.
+    fn delete_shards(&self, chunks: &[(String, ChunkEntry)]) {
+        for (id, entry) in chunks {
+            for (i, loc) in entry.shards.iter().enumerate() {
+                if let Some(b) = self.backend(&loc.backend) {
+                    if let Err(e) = b.delete(&shard_key(id, i)) {
+                        eprintln!("attenzione: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Registra nell'indice un file caricato con `upload` (sostituisce quello che c'era).
+    pub fn commit_upload(&mut self, dest: &str, up: Upload) -> Result<()> {
+        let dest = match self.check_file_dest(dest) {
+            Ok(d) => d,
+            Err(e) => {
+                self.delete_shards(&up.new);
+                return Err(e);
+            }
+        };
+        // un blocco già noto doveva esserci al momento del caricamento: se intanto è sparito
+        // (cancellato da un processo che non rispettava il lock) il file sarebbe incompleto
+        let new_ids: HashSet<&str> = up.new.iter().map(|(id, _)| id.as_str()).collect();
+        if let Some(missing) = up.chunks.iter().find(|id| !new_ids.contains(id.as_str()) && !self.index.chunks.contains_key(*id)) {
+            self.delete_shards(&up.new);
+            bail!("il blocco {} è sparito durante il caricamento: riprova", &missing[..12]);
+        }
+        for (id, entry) in up.new {
+            self.index.chunks.entry(id).or_insert(entry);
+        }
+        for id in &up.chunks {
+            self.index.chunks.get_mut(id).expect("blocco presente").refs += 1;
+        }
+        let entry = FileEntry { size: up.size, hash: up.hash, mtime: up.mtime, chunks: up.chunks };
+        if let Some(old) = self.index.files.insert(dest.clone(), entry) {
             self.release(&old.chunks);
         }
         self.dirty = true;
-        Ok(new_chunks)
+        Ok(())
+    }
+
+    /// `path` è una cartella (esplicita o perché contiene file)? La radice lo è sempre.
+    pub fn is_dir(&self, path: &str) -> bool {
+        if path.is_empty() || self.index.dirs.contains(path) {
+            return true;
+        }
+        let prefix = format!("{path}/");
+        self.index.files.range(prefix.clone()..).next().is_some_and(|(f, _)| f.starts_with(&prefix))
+            || self.index.dirs.range(prefix.clone()..).next().is_some_and(|d| d.starts_with(&prefix))
+    }
+
+    /// Crea una cartella vuota (anche le cartelle intermedie, implicitamente).
+    pub fn mkdir(&mut self, path: &str) -> Result<()> {
+        let path = normalize(path)?;
+        if path.is_empty() || self.is_dir(&path) {
+            return Ok(());
+        }
+        if self.index.files.contains_key(&path) {
+            bail!("{path} è un file");
+        }
+        // nessun antenato può essere un file
+        let parts: Vec<&str> = path.split('/').collect();
+        for i in 1..parts.len() {
+            let anc = parts[..i].join("/");
+            if self.index.files.contains_key(&anc) {
+                bail!("{anc} è un file");
+            }
+        }
+        self.index.dirs.insert(path);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Toglie una cartella vuota (la cartella che la contiene resta).
+    pub fn rmdir(&mut self, path: &str) -> Result<()> {
+        let path = normalize(path)?;
+        if path.is_empty() {
+            bail!("la radice non si può togliere");
+        }
+        let prefix = format!("{path}/");
+        if self.index.files.keys().any(|f| f.starts_with(&prefix)) || self.index.dirs.iter().any(|d| d.starts_with(&prefix)) {
+            bail!("{path}: la cartella non è vuota");
+        }
+        if !self.index.dirs.remove(&path) {
+            bail!("{path}: cartella non presente");
+        }
+        // la cartella madre resta, anche se ora è vuota
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            if !self.is_dir(parent) {
+                self.index.dirs.insert(parent.to_string());
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Cambia la data di modifica di un file, senza riscriverlo.
+    pub fn set_mtime(&mut self, path: &str, mtime: i64) -> Result<()> {
+        let path = normalize(path)?;
+        let f = self.index.files.get_mut(&path).ok_or_else(|| anyhow!("{path}: file non presente"))?;
+        if f.mtime != Some(mtime) {
+            f.mtime = Some(mtime);
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Rinomina o sposta un file o una cartella: cambia solo l'indice, i dati restano dove sono.
+    /// Un file di destinazione esistente viene sostituito; una cartella di destinazione solo se vuota.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let (from, to) = (normalize(from)?, normalize(to)?);
+        if from.is_empty() || to.is_empty() {
+            bail!("la radice non si può rinominare");
+        }
+        if from == to {
+            return Ok(());
+        }
+        if to.starts_with(&format!("{from}/")) {
+            bail!("impossibile spostare {from} dentro sé stessa");
+        }
+        if self.index.files.contains_key(&from) {
+            if self.is_dir(&to) {
+                bail!("{to} è una cartella");
+            }
+            let entry = self.index.files.remove(&from).expect("presente");
+            if let Some(old) = self.index.files.insert(to.clone(), entry) {
+                self.release(&old.chunks);
+            }
+        } else if self.is_dir(&from) {
+            if self.index.files.contains_key(&to) {
+                bail!("{to} è un file");
+            }
+            let to_prefix = format!("{to}/");
+            if self.index.files.keys().any(|f| f.starts_with(&to_prefix)) || self.index.dirs.iter().any(|d| d.starts_with(&to_prefix)) {
+                bail!("{to}: la cartella di destinazione non è vuota");
+            }
+            self.index.dirs.remove(&to);
+            let from_prefix = format!("{from}/");
+            let moved = |p: &str| format!("{to}{}", &p[from.len()..]);
+            let files: Vec<String> = self.index.files.keys().filter(|f| f.starts_with(&from_prefix)).cloned().collect();
+            for f in files {
+                let entry = self.index.files.remove(&f).expect("presente");
+                self.index.files.insert(moved(&f), entry);
+            }
+            let dirs: Vec<String> =
+                self.index.dirs.iter().filter(|d| **d == from || d.starts_with(&from_prefix)).cloned().collect();
+            for d in dirs {
+                self.index.dirs.remove(&d);
+                self.index.dirs.insert(moved(&d));
+            }
+        } else {
+            bail!("{from}: non presente");
+        }
+        self.dirty = true;
+        Ok(())
     }
 
     /// Cifra un blocco, lo divide in k + m frammenti e li scrive in parallelo su backend tutti diversi.
@@ -760,11 +959,22 @@ impl Repo {
 
     /// Toglie un file (o una cartella) dal repository. Restituisce i file tolti.
     pub fn remove(&mut self, path: &str) -> Result<Vec<String>> {
-        let files = self.matching(path)?;
+        let mut files = self.matching(path)?;
         for f in &files {
             if let Some(entry) = self.index.files.remove(f) {
                 self.release(&entry.chunks);
             }
+        }
+        // anche le cartelle vuote esplicite, dentro o uguali a `path`
+        let path = normalize(path)?;
+        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        let dirs: Vec<String> = self.index.dirs.iter().filter(|d| **d == path || d.starts_with(&prefix)).cloned().collect();
+        for d in &dirs {
+            self.index.dirs.remove(d);
+            self.dirty = true;
+        }
+        if files.is_empty() && !dirs.is_empty() {
+            files.push(format!("{path}/"));
         }
         Ok(files)
     }

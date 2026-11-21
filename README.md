@@ -8,7 +8,7 @@ Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di d
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: fase 2 + interfaccia web + mount in sola lettura (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: fase 2 + interfaccia web + mount in lettura e scrittura (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -74,31 +74,62 @@ Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@
 (certificato non valido per un IP: il browser avvisa, come per la dashboard di Traefik) e, se impostato, su
 `https://<CLOUDRAID_HOST>/` (serve un nome che lo risolva: record DNS o file hosts).
 
-## Cartella montata (FUSE, sola lettura)
+## Cartella montata (FUSE)
 
 ```bash
-cloudraid mount /mnt/cloudraid/archivio --allow-other --uid 1000 --gid 1000
+cloudraid mount /mnt/cloudraid/archivio --allow-other --uid 1000 --gid 1000          # sola lettura
+cloudraid mount /mnt/cloudraid/archivio --allow-other --uid 1000 --gid 1000 --rw     # anche scrittura
 ```
 
-Il repository compare come una cartella normale: `ls`, `cp`, file manager, lettori video, condivisione in rete.
+Il repository compare come una cartella normale: `ls`, `cp`, `mv`, `rm`, `mkdir`, file manager, lettori video,
+editor, condivisione in rete.
 
+**Lettura**
 - Cartelle e dimensioni vengono dall'indice in memoria: `ls` e `find` non toccano i backend.
 - Leggendo un file si scaricano solo i blocchi che servono, ognuno verificato con la sua impronta; con backend
   persi (fino a `parity_shards`) si legge con la parità, come `get`.
 - I blocchi letti restano in una cache in memoria (`--cache-mb`, predefinito 256) e il blocco successivo viene chiesto
   in anticipo. Le richieste sono servite in parallelo (`--threads`), così una lettura lenta non blocca `ls`.
 - Ogni `--refresh` secondi (predefinito 30) controlla se interfaccia web o riga di comando hanno salvato un indice
-  più recente: i file nuovi compaiono da soli. Il mount non prende il lock e non scrive niente.
-- Un file aperto resta com'era all'apertura anche se nel frattempo viene sostituito.
-- Permessi: file 0440, cartelle 0550, del proprietario scelto con `--uid`/`--gid`. Con `--allow-other` il kernel
-  fa entrare anche gli altri utenti secondo questi permessi (root entra comunque).
+  più recente: i file nuovi compaiono da soli.
+- Un file aperto in lettura resta com'era all'apertura anche se nel frattempo viene sostituito.
+
+**Scrittura (`--rw`)**
+- Un file aperto per scrivere vive in una **copia locale** nella cartella di appoggio (`--staging`, predefinita
+  `cloudraid-staging` nella cartella temporanea): ci vuole spazio locale pari ai file in scrittura in quel momento.
+  La copia è **in chiaro** e viene cancellata appena il file è caricato.
+- Alla **chiusura** del file (o con `fsync`) la copia viene spezzata in blocchi, cifrata e caricata come fa `put`
+  (con deduplicazione). La chiusura aspetta la fine del caricamento: con backend lenti `cp` resta fermo sull'ultimo
+  file finché non è al sicuro, e un errore arriva al programma invece di perdersi.
+- Modificare un file esistente senza riscriverlo da capo (aggiunta in coda, scrittura in mezzo, troncamento) lo
+  scarica prima per intero nella copia locale.
+- Rinominare e spostare (anche cartelle intere), cancellare, creare cartelle, cambiare la data di modifica: cambiano
+  **solo l'indice**, i dati restano dove sono. Le cartelle vuote vengono salvate nell'indice e compaiono anche
+  nell'interfaccia web.
+- Ogni modifica prende il **lock** del repository. L'indice si salva **entro 2 secondi** dall'ultima modifica,
+  come fa ext4 con i metadati: le modifiche vicine fanno un salvataggio solo (copiare centinaia di file piccoli non
+  costa un giro su tutti i backend per file). `fsync` su un file o su una cartella (`sync -f`) lo salva subito.
+  Se il processo muore in quella finestra, le ultime modifiche all'indice si perdono e i loro blocchi restano orfani.
+- Il lock resta preso mentre le scritture continuano e viene lasciato dopo 5 secondi di calma (salvando prima),
+  così interfaccia web e riga di comando possono tornare a scrivere.
+  Se il lock è di un altro processo (per esempio una riparazione dall'interfaccia), la scrittura aspetta fino a un
+  minuto e poi fallisce con "risorsa occupata".
+- Permessi e proprietario non si salvano: `chmod` e `chown` vengono accettati e ignorati. Niente collegamenti
+  (simbolici o fisici).
+- Se il processo muore con file aperti in scrittura, quelle modifiche si perdono (al riavvio le copie locali
+  rimaste vengono cancellate): il programma che scriveva non ha mai ricevuto la conferma della chiusura.
+
+**In generale**
+- Permessi: file 0440 e cartelle 0550 (0640 e 0750 con `--rw`) del proprietario scelto con `--uid`/`--gid`.
+  Con `--allow-other` il kernel fa entrare anche gli altri utenti secondo questi permessi (root entra comunque).
 - SIGTERM o Ctrl-C smontano in modo pulito; se il processo muore male, all'avvio successivo il mount appeso viene
   smontato da solo.
 
 Nel compose c'è il servizio `mount`, facoltativo (profilo `mount`): metti in `.env` `COMPOSE_PROFILES=mount` e
 `CLOUDRAID_PASSWORD` (all'avvio nessuno può digitarla), poi `docker compose up -d`. Il repository compare sull'host
-in `/mnt/cloudraid/archivio` (`CLOUDRAID_MOUNT_DIR` cambia la cartella madre). Il container ha bisogno di
-`/dev/fuse`, del permesso `SYS_ADMIN` e di uscire dal profilo AppArmor `docker-default`, che vieta `mount`.
+in `/mnt/cloudraid/archivio` (`CLOUDRAID_MOUNT_DIR` cambia la cartella madre), in lettura e scrittura
+(`CLOUDRAID_MOUNT_RW=false` per la sola lettura). Il container ha bisogno di `/dev/fuse`, del permesso `SYS_ADMIN`
+e di uscire dal profilo AppArmor `docker-default`, che vieta `mount`.
 Attenzione: `docker kill` è uno stop manuale, quindi il container non riparte da solo e lascia il mount appeso
 finché non lanci `docker compose up -d`. Un crash vero, invece, fa ripartire il container da solo.
 
@@ -147,7 +178,7 @@ cloudraid status                   # backend disponibili, frammenti per backend
 cloudraid scrub                    # verifica tutti i frammenti
 cloudraid scrub --repair           # e ricostruisce quelli mancanti o danneggiati
 cloudraid unlock                   # cancella i lock scaduti di processi interrotti
-cloudraid mount /mnt/cloudraid     # il repository come cartella in sola lettura (vedi sopra)
+cloudraid mount /mnt/cloudraid --rw  # il repository come cartella (vedi sopra)
 ```
 
 `get`, `ls`, `status` e `scrub` senza `--repair` non prendono il lock: evita di lanciarli mentre un `rm`
@@ -179,6 +210,9 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 
 ## Limiti attuali
 
+- Mount in scrittura, misure sul repository dimostrativo (6 cartelle sullo stesso SSD): 50 MB in 0,5 s, 634 file
+  piccoli (5 MB) in 12 s con `cp -r` o `rsync -a`, circa 18 ms a file (la scrittura dei frammenti con fsync).
+  Con backend cloud ogni file costa almeno un giro di rete sul backend più lento.
 - Se una scrittura si interrompe a metà possono restare frammenti orfani (innocui, occupano spazio):
   la pulizia arriverà con la fase 4.
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
@@ -199,4 +233,5 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
 | 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
 | 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
-| 4 | Mount in scrittura, pulizia dei frammenti orfani, ribilanciamento | |
+| 4a | Mount in scrittura (copia locale caricata alla chiusura), rinomine e cartelle nell'indice | fatta |
+| 4 | Pulizia dei frammenti orfani, ribilanciamento | |

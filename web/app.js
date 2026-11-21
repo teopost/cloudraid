@@ -299,10 +299,16 @@ function renderOverview(st) {
 // ---------------------------------------------------------------------------------------------
 // File
 
-function listing(files, dir) {
+function listing(files, dir, emptyDirs = []) {
   const prefix = dir ? `${dir}/` : '';
   const dirs = new Map();
   const items = [];
+  // cartelle create dal mount, anche vuote
+  for (const p of emptyDirs) {
+    if (!p.startsWith(prefix)) continue;
+    const name = p.slice(prefix.length).split('/')[0];
+    if (name && !dirs.has(name)) dirs.set(name, { name, count: 0, size: 0, mtime: 0 });
+  }
   for (const f of files) {
     if (!f.path.startsWith(prefix)) continue;
     const rest = f.path.slice(prefix.length);
@@ -340,7 +346,7 @@ function renderFiles(st) {
     rows = found.map((f) => fileRow(f, f.path)).join('');
     if (!found.length) rows = `<tr><td colspan="5" class="empty">Nessun file contiene “${esc(state.search)}”.</td></tr>`;
   } else {
-    const { dirs, files } = listing(snap.files, state.dir);
+    const { dirs, files } = listing(snap.files, state.dir, snap.dirs || []);
     rows = dirs.map((d) => {
       const path = state.dir ? `${state.dir}/${d.name}` : d.name;
       return `<tr>

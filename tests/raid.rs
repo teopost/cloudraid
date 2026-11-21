@@ -538,3 +538,62 @@ fn chiave_di_un_altro_repository_non_sovrascritta() {
     repo.save().unwrap();
     assert_eq!(fs::read(path.join("cloudraid.key")).unwrap(), before);
 }
+
+#[test]
+fn rinomina_cartelle_e_date_senza_spostare_dati() {
+    let lab = Lab::new(6, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    let shards_before: usize = (0..6).map(|i| lab.shards_on(i)).sum();
+
+    // file: rinomina e sostituzione di un file esistente
+    repo.rename("medio.bin", "archivio/medio.bin").unwrap();
+    repo.rename("uno.bin", "piccolo.txt").unwrap();
+    assert!(!repo.index().files.contains_key("medio.bin"));
+    assert_eq!(repo.index().files["piccolo.txt"].size, 1);
+    // cartella intera
+    repo.rename("cartella", "altra/dentro").unwrap();
+    assert!(repo.index().files.contains_key("altra/dentro/grande.bin"));
+    assert!(repo.rename("altra", "altra/sotto").is_err(), "dentro sé stessa");
+    assert!(repo.rename("piccolo.txt", "altra").is_err(), "un file su una cartella");
+    assert!(repo.rename("non-esiste", "x").is_err());
+
+    // cartelle vuote esplicite
+    repo.mkdir("vuota/annidata").unwrap();
+    assert!(repo.is_dir("vuota") && repo.is_dir("vuota/annidata"));
+    assert!(repo.mkdir("piccolo.txt/x").is_err(), "sotto un file");
+    assert!(repo.rmdir("vuota").is_err(), "non vuota");
+    repo.rename("vuota", "spostata").unwrap();
+    assert!(repo.index().dirs.contains("spostata/annidata"));
+    let p = lab.src().join("x");
+    fs::write(&p, b"x").unwrap();
+    assert!(repo.put_file(&p, "spostata").is_err(), "un file al posto di una cartella");
+    repo.rmdir("spostata/annidata").unwrap();
+    assert!(repo.rmdir("altra/dentro").is_err(), "contiene file");
+    repo.set_mtime("piccolo.txt", 1_600_000_000).unwrap();
+    repo.save().unwrap();
+    drop(repo);
+
+    // tutto salvato, nessun dato spostato, contenuti intatti; il blocco di "piccolo.txt" vecchio è stato liberato
+    let mut repo = lab.open();
+    assert!(repo.index().dirs.contains("spostata") && !repo.index().dirs.contains("spostata/annidata"));
+    assert_eq!(repo.index().files["piccolo.txt"].mtime, Some(1_600_000_000));
+    let renamed: Vec<(String, Vec<u8>)> = samples
+        .iter()
+        .filter_map(|(n, d)| match n.as_str() {
+            "medio.bin" => Some(("archivio/medio.bin".into(), d.clone())),
+            "uno.bin" => Some(("piccolo.txt".into(), d.clone())),
+            "cartella/grande.bin" => Some(("altra/dentro/grande.bin".into(), d.clone())),
+            "vuoto.bin" => Some((n.clone(), d.clone())),
+            _ => None,
+        })
+        .collect();
+    check_all(&lab, &repo, &renamed);
+    let shards_after: usize = (0..6).map(|i| lab.shards_on(i)).sum();
+    assert!(shards_after < shards_before && shards_after > 0);
+    // `rm` di una cartella toglie anche le cartelle vuote che contiene
+    repo.lock().unwrap();
+    assert_eq!(repo.remove("spostata").unwrap(), ["spostata/"]);
+    assert!(!repo.is_dir("spostata"));
+    repo.save().unwrap();
+}

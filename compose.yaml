@@ -3,7 +3,7 @@
 # - web: sempre acceso, dietro Traefik, solo dalla LAN (middleware lan-only@file). Risponde su
 #   https://<LAN_IP>/cloudraid/ e, se c'è un nome che lo risolve, su https://<CLOUDRAID_HOST>/.
 #   Il login usa la password del repository, che resta solo in memoria: dopo un riavvio serve un nuovo accesso.
-# - mount: il repository come cartella in sola lettura sull'host (/mnt/cloudraid/archivio), facoltativo.
+# - mount: il repository come cartella sull'host (/mnt/cloudraid/archivio), facoltativo.
 # - cloudraid: la riga di comando, a richiesta, con lo script ./cloudraid (es. `./cloudraid status`).
 #   Il profilo "cli" evita che `docker compose up -d` lo avvii.
 #
@@ -40,9 +40,11 @@ services:
       - traefik.http.services.cloudraid.loadbalancer.server.port=8080
 
   mount:
-    # Il repository come cartella in sola lettura sull'host: ${CLOUDRAID_MOUNT_DIR}/archivio
-    # (predefinito /mnt/cloudraid/archivio). Profilo "mount": si attiva con COMPOSE_PROFILES=mount
-    # in .env, e serve CLOUDRAID_PASSWORD in .env perché all'avvio non c'è nessuno a digitarla.
+    # Il repository come cartella sull'host: ${CLOUDRAID_MOUNT_DIR}/archivio (predefinito
+    # /mnt/cloudraid/archivio), in lettura e scrittura (CLOUDRAID_MOUNT_RW=false per la sola lettura).
+    # Profilo "mount": si attiva con COMPOSE_PROFILES=mount in .env, e serve CLOUDRAID_PASSWORD in .env
+    # perché all'avvio non c'è nessuno a digitarla. I file in scrittura passano in chiaro da /tmp del
+    # container (sul disco di sistema) e vengono cancellati appena caricati.
     image: cloudraid:local
     pull_policy: never
     container_name: cloudraid-mount
@@ -59,6 +61,7 @@ services:
         required: false
     environment:
       TZ: Europe/Rome
+      CLOUDRAID_MOUNT_RW: ${CLOUDRAID_MOUNT_RW:-true}
     # FUSE: il dispositivo, il permesso di montare e niente profilo AppArmor docker-default (vieta mount)
     devices: [/dev/fuse]
     cap_add: [SYS_ADMIN]

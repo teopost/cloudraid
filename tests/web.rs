@@ -275,6 +275,8 @@ fn modifiche_dalla_riga_di_comando_non_vanno_perse() {
         let p = lab.tmp.path().join("cli.bin");
         fs::write(&p, random("cli", 120_000)).unwrap();
         cli.put_file(&p, "dalla-cli.bin").unwrap();
+        // una cartella vuota, come quelle create dal mount
+        cli.mkdir("vuota/dentro").unwrap();
         cli.save().unwrap();
     }
 
@@ -288,6 +290,7 @@ fn modifiche_dalla_riga_di_comando_non_vanno_perse() {
         .map(|f| f["path"].as_str().unwrap().to_string())
         .collect();
     assert_eq!(files, ["dal-web-1.bin", "dal-web-2.bin", "dalla-cli.bin"]);
+    assert_eq!(status(&lab, &cookie)["snapshot"]["dirs"], serde_json::json!(["vuota/dentro"]));
 
     // e la riga di comando vede tutto
     let cli = Repo::open(lab.cfg.clone(), PW).unwrap();

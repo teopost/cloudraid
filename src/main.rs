@@ -62,7 +62,7 @@ enum Cmd {
         #[arg(long)]
         insecure_cookie: bool,
     },
-    /// Monta il repository come cartella in sola lettura (FUSE); resta attivo fino a Ctrl-C o SIGTERM
+    /// Monta il repository come cartella (FUSE); resta attivo fino a Ctrl-C o SIGTERM
     Mount {
         /// Cartella in cui montare
         mountpoint: PathBuf,
@@ -83,6 +83,12 @@ enum Cmd {
         /// Richieste servite in parallelo
         #[arg(long, default_value_t = 16)]
         threads: usize,
+        /// Anche in scrittura: i file scritti passano da una copia locale e vengono caricati alla chiusura
+        #[arg(long, env = "CLOUDRAID_MOUNT_RW")]
+        rw: bool,
+        /// Cartella di appoggio per i file in scrittura (con --rw; predefinita: cloudraid-staging nella cartella temporanea)
+        #[arg(long)]
+        staging: Option<PathBuf>,
     },
     /// Cancella i lock lasciati da processi interrotti
     Unlock {
@@ -240,7 +246,8 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let mut repo = Repo::open(cfg.clone(), &password(false)?)?;
-    if let Cmd::Mount { mountpoint, refresh, cache_mb, uid, gid, allow_other, threads } = cli.cmd {
+    if let Cmd::Mount { mountpoint, refresh, cache_mb, uid, gid, allow_other, threads, rw, staging } = cli.cmd {
+        let staging = rw.then(|| staging.unwrap_or_else(|| std::env::temp_dir().join("cloudraid-staging")));
         return cloudraid::mount::mount(
             repo,
             cloudraid::mount::MountOptions {
@@ -251,6 +258,7 @@ fn run(cli: Cli) -> Result<()> {
                 gid,
                 allow_other,
                 threads,
+                staging,
             },
         );
     }

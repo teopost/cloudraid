@@ -154,6 +154,8 @@ struct Snapshot {
     stored_size: u64,
     chunks: usize,
     files: Vec<FileRow>,
+    /// Cartelle vuote create dal mount (le altre si ricavano dai file).
+    dirs: Vec<String>,
     backends: Vec<BackendRow>,
     locks: Vec<LockRow>,
 }
@@ -206,6 +208,7 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
             .iter()
             .map(|(p, f)| FileRow { path: p.clone(), size: f.size, mtime: f.mtime, chunks: f.chunks.len() })
             .collect(),
+        dirs: ix.dirs.iter().cloned().collect(),
         backends: repo
             .status()
             .into_iter()

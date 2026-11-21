@@ -2,7 +2,7 @@
 //! i frammenti di ogni blocco. Viene cifrato e copiato su tutti i backend.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct Index {
@@ -10,6 +10,10 @@ pub struct Index {
     pub generation: u64,
     pub files: BTreeMap<String, FileEntry>,
     pub chunks: BTreeMap<String, ChunkEntry>,
+    /// Cartelle create esplicitamente (dal mount): le altre esistono perché contengono file.
+    /// Assente negli indici vecchi e omessa quando è vuota, così il formato resta compatibile.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub dirs: BTreeSet<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
