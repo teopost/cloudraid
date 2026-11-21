@@ -2,7 +2,7 @@
 //! di test ha /dev/fuse ed è root (`make test`), un mount FUSE vero con il binario.
 
 use cloudraid::mount::{read_range, Cache, ChunkRef, Inodes, Tree};
-use cloudraid::{BackendConfig, BackendKind, ChunkConfig, Config, RcloneConfig, Repo};
+use cloudraid::{AppsConfig, BackendConfig, BackendKind, ChunkConfig, Config, Repo};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -18,7 +18,8 @@ fn config(tmp: &Path) -> Config {
         parity_shards: 2,
         chunk: SMALL,
         transfers: 4,
-        rclone: RcloneConfig::default(),
+        apps: AppsConfig::default(),
+        dir: None,
         backends: (0..6)
             .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) }, delay_ms: 0 })
             .collect(),

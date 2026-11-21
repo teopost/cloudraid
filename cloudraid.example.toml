@@ -1,4 +1,6 @@
 # Configurazione di esempio: copiala in cloudraid.toml e adatta i percorsi.
+# Il modo più semplice per aggiungere account cloud è l'interfaccia web (Spazi > Aggiungi):
+# prova la connessione, salva le credenziali cifrate e scrive questo file per te.
 #
 # Ogni blocco di dati diventa data_shards + parity_shards frammenti, ognuno su un
 # backend diverso. Si possono perdere fino a parity_shards backend senza perdere dati.
@@ -17,45 +19,60 @@ parity_shards = 2
 # avg = 4194304
 # max = 16777216
 
-# Facoltativo: come avviare rclone, per i backend di tipo "rclone".
-# [rclone]
-# binary = "rclone"
-# config = "/root/.config/rclone/rclone.conf"   # predefinito: quello di rclone
-# args = ["--tpslimit", "10"]                    # opzioni in più per `rclone rcd`
+# Password, chiavi segrete e token NON stanno qui: sono in credenziali.bin accanto a
+# questo file, cifrate con la chiave del repository (le scrive l'interfaccia web).
 
 # Servono almeno data_shards + parity_shards backend. Con uno in più, `scrub --repair`
 # può spostare i frammenti di un account perso anche senza sostituirlo.
 [[backend]]
-name = "account1"
+name = "disco1"
 type = "local"
-path = "/srv/cloudraid/account1"
+path = "/srv/cloudraid/disco1"
 # solo per prove: ogni lettura da questo backend aspetta 1,5 s, come un account lento
 # delay_ms = 1500
 
 [[backend]]
-name = "account2"
+name = "disco2"
 type = "local"
-path = "/srv/cloudraid/account2"
+path = "/srv/cloudraid/disco2"
 
+# WebDAV (Nextcloud, ownCloud, NAS): l'indirizzo della cartella del repository.
+# Per Nextcloud: https://<server>/remote.php/dav/files/<utente>/cloudraid
+# Password (meglio una "password per app") nelle credenziali.
 [[backend]]
-name = "account3"
-type = "local"
-path = "/srv/cloudraid/account3"
+name = "nextcloud"
+type = "webdav"
+url = "https://cloud.esempio.it/remote.php/dav/files/stefano/cloudraid"
+user = "stefano"
 
+# S3 e compatibili (AWS, Backblaze B2, Wasabi, MinIO). Chiave segreta nelle credenziali.
 [[backend]]
-name = "account4"
-type = "local"
-path = "/srv/cloudraid/account4"
+name = "b2"
+type = "s3"
+endpoint = "https://s3.eu-central-003.backblazeb2.com"
+region = "eu-central-003"
+bucket = "cloudraid-stefano"
+access_key = "0031234567890000000000001"
+# prefix = "cloudraid"      # facoltativo: solo una parte del bucket
+# path_style = true         # indirizzi endpoint/bucket/oggetto (vale per quasi tutti)
 
-# Un backend rclone è un remote configurato con `rclone config`, seguito dalla
-# cartella del repository: Google Drive, OneDrive, Dropbox, MEGA, pCloud, SFTP,
-# WebDAV, S3 e tutti gli altri provider di rclone.
-[[backend]]
-name = "gdrive"
-type = "rclone"
-remote = "gdrive:cloudraid"
-
+# Dropbox e OneDrive: la cartella dell'app ("Applicazioni/<nome app>"); account collegato
+# dall'interfaccia web, token nelle credenziali.
 [[backend]]
 name = "dropbox"
-type = "rclone"
-remote = "dropbox:cloudraid"
+type = "dropbox"
+# folder = "cloudraid"      # facoltativo: una sottocartella
+
+# Google Drive: una cartella nel Drive; cloudraid vede solo i file che crea lui.
+[[backend]]
+name = "gdrive"
+type = "gdrive"
+folder = "cloudraid"
+# folder_id = "..."         # lo scrive cloudraid quando crea la cartella
+
+# Applicazioni registrate presso i provider con login (una volta sola, vedi il README).
+# [apps]
+# dropbox_app_key = "..."
+# onedrive_client_id = "..."
+# google_client_id = "....apps.googleusercontent.com"
+# google_client_secret = "..."

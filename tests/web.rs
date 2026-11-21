@@ -1,7 +1,7 @@
 //! Test dell'interfaccia web attraverso HTTP, con cartelle locali al posto degli account.
 
 use cloudraid::web::{start, ServeOptions};
-use cloudraid::{BackendConfig, BackendKind, ChunkConfig, Config, RcloneConfig, Repo};
+use cloudraid::{AppsConfig, BackendConfig, BackendKind, ChunkConfig, Config, Repo};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Read;
@@ -23,7 +23,8 @@ fn config(tmp: &TempDir) -> Config {
         parity_shards: 2,
         chunk: ChunkConfig { min: 16 << 10, avg: 64 << 10, max: 256 << 10 },
         transfers: 4,
-        rclone: RcloneConfig::default(),
+        apps: AppsConfig::default(),
+        dir: None,
         backends: (0..6)
             .map(|i| BackendConfig {
                 name: format!("acc{i}"),

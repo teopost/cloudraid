@@ -1,14 +1,14 @@
 # cloudraid
 
 Archivio cifrato con ridondanza **Reed-Solomon** distribuito su più storage, come un RAID 5/6
-in cui i "dischi" sono account diversi: cartelle locali e qualsiasi storage raggiungibile con rclone
-(Google Drive, OneDrive, Dropbox, MEGA, pCloud, SFTP, WebDAV, S3…).
+in cui i "dischi" sono account diversi: cartelle locali, **Google Drive, OneDrive, Dropbox, WebDAV (Nextcloud) e S3**
+(Backblaze B2, Wasabi, AWS, MinIO...). Un solo binario: parla direttamente con i servizi, senza programmi esterni.
 
 Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di dati e 2 di parità,
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: tutte le fasi previste completate: interfaccia web, mount in lettura e scrittura, letture "a gara", pulizia e ribilanciamento (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: tutte le fasi previste completate, backend nativi senza rclone dalla 0.9 (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -19,7 +19,11 @@ file → blocchi a lunghezza variabile (FastCDC, ~4 MiB) → deduplicazione
 ```
 
 - **Cifratura lato client.** I backend vedono solo frammenti illeggibili con nomi casuali. La chiave principale
-  è protetta dalla password con Argon2id e salvata (cifrata) su ogni backend, in `cloudraid.key`.
+  è protetta dalla password con Argon2id e salvata (cifrata) su ogni backend, in `cloudraid.key`, con una copia
+  accanto alla configurazione.
+- **Credenziali cifrate.** Password WebDAV, chiavi segrete S3 e token degli account stanno in `credenziali.bin`,
+  accanto alla configurazione, cifrati con una chiave derivata da quella del repository: senza la password del
+  repository non servono a niente. `cloudraid.toml` non contiene segreti.
 - **Deduplicazione.** I blocchi uguali, anche in file diversi, vengono salvati una volta sola.
 - **Integrità.** Ogni frammento ha il suo hash BLAKE3 nell'indice: un frammento alterato si tratta come
   mancante. Anche ogni blocco e ogni file vengono verificati dopo la ricostruzione.
@@ -33,26 +37,64 @@ file → blocchi a lunghezza variabile (FastCDC, ~4 MiB) → deduplicazione
 
 ## Backend
 
-| Tipo | Configurazione | Note |
-|---|---|---|
-| `local` | `path = "/mnt/disco1/cloudraid"` | cartella o disco montato |
-| `rclone` | `remote = "gdrive:cloudraid"` | qualsiasi remote di `rclone config` più la cartella del repository |
+| Tipo | Che cosa | Configurazione | Credenziale (in `credenziali.bin`) |
+|---|---|---|---|
+| `local` | cartella o disco montato | `path` | nessuna |
+| `webdav` | Nextcloud, ownCloud, NAS... | `url` della cartella, `user` | password (meglio una "password per app") |
+| `s3` | AWS, Backblaze B2, Wasabi, MinIO... | `endpoint`, `region`, `bucket`, `access_key`, `prefix`, `path_style` | chiave segreta |
+| `dropbox` | la cartella dell'app (`Applicazioni/<app>`) | `folder` facoltativa | token, dal collegamento dell'account |
+| `onedrive` | la cartella dell'app (`Applicazioni/<app>`) | `folder` facoltativa | token, dal collegamento dell'account |
+| `gdrive` | una cartella nel Drive, scope `drive.file` | `folder`, `folder_id` | token, dal collegamento dell'account |
 
-Per i backend rclone cloudraid avvia **un solo** `rclone rcd`, raggiungibile solo da 127.0.0.1 con credenziali
-casuali, e lo chiude all'uscita. Login OAuth, rinnovo dei token, limiti di traffico dei provider e cache delle cartelle
-restano a rclone: ogni account si configura una volta con `rclone config` (vedi la sezione `[rclone]` di
-`cloudraid.example.toml` per scegliere eseguibile, file di configurazione e opzioni). Le operazioni fallite per
-errori temporanei vengono ripetute fino a 4 volte.
+Il modo semplice per aggiungere un backend è l'interfaccia web, pagina **Spazi**, "Aggiungi uno spazio": si sceglie il
+servizio, si compilano pochi campi (o si collega l'account), cloudraid crea la cartella, scrive, rilegge, elenca e
+cancella un file di prova, e **solo se tutto va bene** salva le credenziali cifrate e aggiunge il backend a
+`cloudraid.toml` (conservandone i commenti; la versione precedente resta in `cloudraid.toml.bak`). Web e mount
+passano alla configurazione nuova senza riavvio e senza chiedere di nuovo la password.
 
-Un backend è **disponibile** se la sua cartella del repository esiste. Una cartella sparita (account perso, disco
-smontato) si tratta come un disco guasto.
+Come parla con ciascun servizio, tutto implementato in cloudraid (client HTTPS con rustls e certificati inclusi):
 
-**Aggiungere un backend** a un repository esistente: aggiungi la sezione `[[backend]]` alla configurazione, crea a mano
-la cartella del repository (`mkdir` oppure `rclone mkdir nuovoaccount:cloudraid`) e riavvia i servizi. Alla prima
-scrittura il backend nuovo riceve l'indice e la chiave cifrata del repository (`cloudraid.key`), e da lì in poi i
-frammenti nuovi si distribuiscono anche su di lui; per spostarci anche una parte di quelli già scritti usa
-`cloudraid rebalance` (vedi sotto).
-Se la cartella contiene già la chiave di un **altro** repository, cloudraid non la tocca e avvisa.
+- **WebDAV**: PUT/GET/DELETE, MKCOL per le cartelle (create quando servono), PROPFIND con profondità 1 (Nextcloud non
+  permette la profondità infinita), autenticazione Basic.
+- **S3**: PutObject, GetObject, DeleteObject, ListObjectsV2 a pagine, firma **AWS Signature V4** (verificata con
+  l'esempio della documentazione AWS e contro un server che controlla le firme).
+- **Dropbox**: API v2, upload semplice (fino a 150 MB), `list_folder` anche ricorsivo; collegamento con codice da
+  incollare e PKCE, senza segreti.
+- **OneDrive**: Microsoft Graph nella cartella dell'app, indirizzi per percorso, download seguendo a mano il
+  reindirizzamento (il token non va al sito di download); collegamento con codice dispositivo.
+- **Google Drive**: API v3 con lo scope `drive.file` (cloudraid vede solo i file che crea lui), cache percorso →
+  identificativo, cartelle create una alla volta, caricamento multipart fino a 4 MB e "resumable" oltre;
+  collegamento con codice dispositivo.
+- Per tutti: nuovi tentativi con attesa crescente (1, 2, 4, 8 s) su errori temporanei, 429 e limiti di velocità,
+  rispettando `Retry-After`; token d'accesso rinnovati da soli, e salvato il refresh token nuovo quando il provider lo
+  cambia (Microsoft lo fa a ogni rinnovo).
+
+Un backend è **disponibile** se risponde e la cartella (o il bucket) del repository esiste. Uno irraggiungibile si
+tratta come un disco guasto. Alla prima scrittura un backend nuovo riceve anche la chiave cifrata del repository;
+se ne contiene già una di un **altro** repository, cloudraid non la tocca e avvisa.
+
+### Registrare cloudraid presso Google, Microsoft e Dropbox (una volta sola)
+
+Per collegare account di questi tre servizi, cloudraid deve essere registrato come applicazione: lo fai tu, una volta,
+dal tuo account, e metti i valori in Spazi → "Collegamento con Google, Microsoft e Dropbox" (finiscono nella sezione
+`[apps]` di `cloudraid.toml`; non sono password). La stessa finestra contiene queste guide passo passo:
+
+- **Google Drive**: console.cloud.google.com → nuovo progetto → abilita *Google Drive API* → schermata di consenso
+  OAuth di tipo *Esterno* con l'ambito `.../auth/drive.file` → **pubblica** l'app (con il solo drive.file non serve la
+  verifica, e i collegamenti non scadono dopo 7 giorni come in modalità test) → Credenziali → ID client OAuth di tipo
+  **TV e dispositivi con input limitato** → `google_client_id` e `google_client_secret`.
+- **OneDrive**: entra.microsoft.com → Registrazioni app → nuova, account Microsoft personali → Autenticazione:
+  **Consenti flussi client pubblici = Sì** → autorizzazioni Graph `Files.ReadWrite.AppFolder` e `offline_access` →
+  `onedrive_client_id` (ID applicazione).
+- **Dropbox**: dropbox.com/developers/apps → *Scoped access*, **App folder** → permessi `files.content.write`,
+  `files.content.read`, `files.metadata.read` → `dropbox_app_key` (l'App secret non serve: PKCE).
+
+In alternativa le variabili d'ambiente `CLOUDRAID_DROPBOX_APP_KEY`, `CLOUDRAID_ONEDRIVE_CLIENT_ID`,
+`CLOUDRAID_GOOGLE_CLIENT_ID` e `CLOUDRAID_GOOGLE_CLIENT_SECRET`.
+
+**Da rclone (fino alla 0.8)**: i backend `type = "rclone"` e la sezione `[rclone]` non sono più accettati (cloudraid lo dice
+chiaramente all'avvio). Toglili dalla configurazione e riaggiungi gli stessi account dall'interfaccia; `rclone.conf` non
+serve più.
 
 ## Interfaccia web
 
@@ -136,7 +178,7 @@ finché non lanci `docker compose up -d`. Un crash vero, invece, fa ripartire il
 
 ## Installazione sul server (Docker)
 
-Il progetto sta in `/srv/docker/cloudraid`, come le altre app. L'immagine contiene cloudraid e rclone 1.71;
+Il progetto sta in `/srv/docker/cloudraid`, come le altre app. L'immagine contiene solo cloudraid;
 `compose.yaml` monta la configurazione (`./config`) e i backend locali (`/srv/cloudraid`).
 cloudraid è un comando, non un servizio: si lancia con lo script `./cloudraid`, che monta anche la cartella corrente,
 così i percorsi relativi funzionano come con un programma installato.
@@ -146,13 +188,16 @@ cd /srv/docker/cloudraid
 make build                                   # costruisce l'immagine cloudraid:local
 ( umask 077; cp .env.example .env )          # poi controlla LAN_IP
 install -d -m 700 config
-cp cloudraid.example.toml config/cloudraid.toml   # poi adatta i backend
-# solo i remote di rclone che servono (rclone ci riscrive i token rinnovati):
-( umask 077; awk '/^\[/{p=($0=="[gdrive]"||$0=="[dropbox]")} p' /root/.config/rclone/rclone.conf > config/rclone.conf )
+cp cloudraid.example.toml config/cloudraid.toml   # per cominciare bastano cartelle locali
 ./cloudraid init
 ./cloudraid status
 docker compose up -d web                     # interfaccia web: https://<LAN_IP>/cloudraid/
 ```
+
+Poi gli account cloud si aggiungono dall'interfaccia (Spazi), e le cartelle locali si possono dismettere.
+`init` crea il repository solo su backend che non chiedono credenziali (cartelle locali): le credenziali sono cifrate con
+la chiave del repository, che ancora non esiste. Le cartelle che l'interfaccia può creare devono stare dentro
+`/srv/cloudraid` (`CLOUDRAID_LOCAL_ROOT`), l'unica cartella dell'host montata nel container.
 
 Facoltativo: `CLOUDRAID_PASSWORD` in `.env` (`chmod 600`, modello in `.env.example`) per gli usi non interattivi,
 per esempio uno `scrub` periodico da cron.
@@ -162,7 +207,10 @@ per esempio uno `scrub` periodico da cron.
 ## Sviluppo
 
 `make test` lancia i test in un container `rust:1-bookworm`. La cache di compilazione sta in `~/.cache/cloudraid-build`,
-fuori da `/srv/docker`, così non finisce nei backup. I test dei backend rclone usano il rclone dell'host, se c'è.
+fuori da `/srv/docker`, così non finisce nei backup. I backend di rete si provano contro server finti in memoria che
+seguono le API vere (`tests/cloud.rs`): WebDAV, S3 con la verifica della firma di ogni richiesta, Dropbox, OneDrive e
+Google Drive con collegamento dell'account, rinnovo dei token, reindirizzamenti e limiti di velocità; sopra di loro un
+repository vero, costruito come fa l'interfaccia web.
 Il test del mount FUSE vero gira se c'è `/dev/fuse` (il Makefile passa al container dispositivo e permessi),
 altrimenti viene saltato.
 
@@ -208,8 +256,8 @@ Misura sul repository dimostrativo (7 cartelle, 27 MB) con una cartella rallenta
 
 ### Pulizia e ribilanciamento
 
-- `cloudraid gc` elenca tutti gli oggetti nelle cartelle `data/` dei backend (su rclone con una sola chiamata
-  ricorsiva) e cancella quelli che l'indice non usa: frammenti di caricamenti interrotti, file temporanei, copie
+- `cloudraid gc` elenca tutti gli oggetti nelle cartelle `data/` dei backend (su Dropbox e S3 con elenchi
+  ricorsivi, sugli altri cartella per cartella) e cancella quelli che l'indice non usa: frammenti di caricamenti interrotti, file temporanei, copie
   vecchie rimaste su un backend tornato disponibile dopo una riparazione. Prende il lock, così nessun altro
   processo sta caricando frammenti non ancora nell'indice. I backend non raggiungibili vengono saltati.
 - `cloudraid rebalance` sposta frammenti dai backend sopra la media a quelli più vuoti, per esempio dopo averne
@@ -240,16 +288,16 @@ altrimenti cloudraid rifiuta e chiede di aggiungere prima il sostituto.
   `get` avvisa quando ha dovuto usare la parità.
 - Le **scritture** vengono rifiutate se i backend disponibili sono meno di `data_shards + parity_shards`:
   meglio non scrivere che scrivere senza ridondanza.
-- Sostituisci il backend con uno nuovo e vuoto (stesso nome nella configurazione, cartella creata a mano,
-  per esempio `rclone mkdir nuovoaccount:cloudraid`) e lancia
-  `cloudraid scrub --repair`: i frammenti mancanti vengono ricostruiti lì. Con un backend in più del necessario,
+- Il modo più semplice: aggiungi un account nuovo dall'interfaccia e "Dismetti" quello guasto, i suoi frammenti
+  vengono ricostruiti dalla parità sugli altri. Oppure, a mano, rimetti al suo posto un backend nuovo e vuoto con lo
+  stesso nome e lancia `cloudraid scrub --repair`: i frammenti mancanti vengono ricostruiti lì. Con un backend in più del necessario,
   `scrub --repair` sposta i frammenti sui backend liberi anche senza sostituzione.
 - `scrub` esce con errore se trova blocchi irrecuperabili, ed elenca i file danneggiati: si può usare da cron.
 
 ## Formato sui backend
 
 ```
-cloudraid.key                  chiave principale cifrata con la password (JSON)
+cloudraid.key                  chiave principale cifrata con la password (JSON; copia anche accanto alla configurazione)
 index/00000000000000000042.bin indice cifrato, ultime 3 generazioni
 locks/<id>.json                lock di chi sta modificando il repository (host, pid, ora)
 data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del frammento>
@@ -265,9 +313,10 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
   istante se ne accorgono rileggendo i lock, ma è una protezione dagli errori, non una garanzia assoluta.
 - Le **scritture** vanno alla velocità del backend più lento: ogni blocco ha un frammento su ognuno di k + m backend.
-  Nella prova reale (21/11/2026, 33 MB, 4 cartelle locali + Google Drive + Dropbox) `put` ha impiegato 537 s:
-  Google Drive col client_id condiviso di rclone risponde `RATE_LIMIT_EXCEEDED` e rclone rallenta. Con Google Drive
-  serve un **client_id proprio** (<https://rclone.org/drive/#making-your-own-client-id>).
+- Dropbox, OneDrive e Google Drive sono provati contro server finti fedeli alle API, non ancora contro gli account
+  veri: serve prima registrare le app (vedi sopra). WebDAV e S3 sono provati anche contro server veri
+  (hacdias/webdav e Versity S3 Gateway, che controlla le firme).
+- `init` solo su cartelle locali (vedi Installazione).
 - Anche l'elenco delle versioni dell'indice, all'apertura, aspetta tutti i backend: serve a non perdere l'indice
   più recente se è rimasto solo su un backend.
 - Lo spazio libero dei backend non viene controllato prima di scrivere: un account pieno fa fallire la scrittura,
@@ -278,10 +327,11 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | Fase | Contenuto | Stato |
 |---|---|---|
 | 1 | CLI `init/put/get/ls/rm/status/scrub`, cifratura, Reed-Solomon, backend locali, test | fatta |
-| 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
+| 2 | Backend rclone, trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta, rclone tolto nella 6 |
 | 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
 | 5 | Dismissione di un backend (`retire`), anche dall'interfaccia web | fatta |
 | 2b | Letture "a gara": i k frammenti dai backend più rapidi, uno in più se qualcuno tarda; chiave e indice dal primo che risponde | fatta |
 | 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
 | 4a | Mount in scrittura (copia locale caricata alla chiusura), rinomine e cartelle nell'indice | fatta |
 | 4 | Pulizia dei frammenti orfani (`gc`) e ribilanciamento (`rebalance`), da riga di comando e interfaccia web | fatta |
+| 6 | Backend nativi (WebDAV, S3, Dropbox, OneDrive, Google Drive) senza rclone, credenziali cifrate, pagina Spazi con aggiunta guidata | fatta |

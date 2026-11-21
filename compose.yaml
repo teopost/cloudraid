@@ -19,7 +19,7 @@ services:
     environment:
       TZ: Europe/Rome
     volumes:
-      # cloudraid.toml, rclone.conf (rclone ci riscrive i token rinnovati), web-state.json (cronologia)
+      # cloudraid.toml (l'interfaccia la modifica), credenziali.bin (cifrate), cloudraid.key, web-state.json
       - ./config:/config
       # backend locali: stesso percorso dentro e fuori dal container
       - /srv/cloudraid:/srv/cloudraid

@@ -270,6 +270,7 @@ fn run(cli: Cli) -> Result<()> {
                 allow_other,
                 threads,
                 staging,
+                config: Some(cli.config.clone()),
             },
         );
     }

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::backend::{self, Backend};
 use crate::config::Config;
+use crate::credentials::Credentials;
 use crate::crypto::{self, random_hex, KeyFile, Keys};
 use crate::erasure;
 use crate::index::{ChunkEntry, FileEntry, Index, ShardLoc};
@@ -33,7 +34,9 @@ const LOCK_REFRESH_SECS: u64 = 5 * 60;
 pub struct Repo {
     cfg: Config,
     backends: Vec<Arc<dyn Backend>>,
-    keys: Keys,
+    keys: Arc<Keys>,
+    /// Credenziali degli account, cifrate accanto alla configurazione.
+    creds: Arc<Credentials>,
     /// La chiave principale cifrata: serve per verificare la password senza rileggere i backend.
     keyfile: KeyFile,
     index: Index,
@@ -287,22 +290,26 @@ impl Repo {
     /// Crea un repository nuovo su tutti i backend della configurazione.
     pub fn init(cfg: Config, password: &str) -> Result<Repo> {
         cfg.validate()?;
-        let backends = backend::open_all(&cfg)?;
+        let (kf, keys) = crypto::create(password)?;
+        let keys = Arc::new(keys);
+        let creds = Credentials::load(cfg.dir.as_deref(), keys.clone())?;
+        let backends = backend::open_all(&cfg, &creds);
         for b in &backends {
             b.create()?;
             if b.get(KEYFILE)?.is_some() {
                 bail!("il backend {} contiene già un repository cloudraid", b.name());
             }
         }
-        let (kf, keys) = crypto::create(password)?;
         let json = serde_json::to_vec_pretty(&kf)?;
         for b in &backends {
             b.put(KEYFILE, &json)?;
         }
+        save_local_keyfile(&cfg, &kf)?;
         let mut repo = Repo {
             cfg,
             backends,
             keys,
+            creds,
             keyfile: kf,
             index: Index::default(),
             dirty: true,
@@ -315,33 +322,52 @@ impl Repo {
         Ok(repo)
     }
 
-    /// Apre un repository esistente: basta un backend con la chiave e l'indice.
+    /// Apre un repository esistente. La chiave cifrata si prende dalla copia accanto alla
+    /// configurazione (serve per aprire le credenziali degli account, e quindi i backend cloud);
+    /// se manca, dal primo backend che risponde, e poi se ne salva la copia.
     pub fn open(cfg: Config, password: &str) -> Result<Repo> {
         cfg.validate()?;
-        let backends = backend::open_all(&cfg)?;
-        // verifica la disponibilità di tutti i backend in parallelo (per rclone è una chiamata di rete)
+        let (keyfile, from_backends) = match load_local_keyfile(&cfg) {
+            Some(kf) => (kf, false),
+            None => {
+                // senza credenziali: rispondono solo i backend che non ne hanno bisogno (cartelle locali)
+                let none = Credentials::load(None, Arc::new(Keys::ephemeral()))?;
+                let backends = backend::open_all(&cfg, &none);
+                parallel(&backends, |b| b.is_available());
+                let avail: Vec<usize> = (0..backends.len()).filter(|&i| backends[i].is_available()).collect();
+                let kf = race_get(&backends, &avail, KEYFILE, |i, data| match serde_json::from_slice::<KeyFile>(&data) {
+                    Ok(kf) => Some(kf),
+                    Err(_) => {
+                        eprintln!("attenzione: {KEYFILE} danneggiato sul backend {}", backends[i].name());
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "chiave del repository non trovata: né accanto alla configurazione né su un backend raggiungibile \
+                         (serve `cloudraid init`?)"
+                    )
+                })?;
+                (kf, true)
+            }
+        };
+        let keys = Arc::new(crypto::unlock(&keyfile, password)?);
+        if from_backends {
+            save_local_keyfile(&cfg, &keyfile)?;
+        }
+        let creds = Credentials::load(cfg.dir.as_deref(), keys.clone())?;
+        let backends = backend::open_all(&cfg, &creds);
+        // verifica la disponibilità di tutti i backend in parallelo (per quelli di rete è una chiamata)
         let avail = parallel(&backends, |b| b.is_available());
         if !avail.contains(&true) {
             bail!("nessun backend disponibile");
         }
-
-        // la chiave è uguale su tutti i backend: vale la prima copia integra che arriva
-        let avail: Vec<usize> = (0..backends.len()).filter(|&i| backends[i].is_available()).collect();
-        let keyfile = race_get(&backends, &avail, KEYFILE, |i, data| match serde_json::from_slice::<KeyFile>(&data) {
-            Ok(kf) => Some(kf),
-            Err(_) => {
-                eprintln!("attenzione: {KEYFILE} danneggiato sul backend {}", backends[i].name());
-                None
-            }
-        })
-        .ok_or_else(|| anyhow!("nessun backend disponibile contiene la chiave del repository (serve `cloudraid init`?)"))?;
-        let keys = crypto::unlock(&keyfile, password)?;
-
         let index = load_latest_index(&backends, &keys)?;
         Ok(Repo {
             cfg,
             backends,
             keys,
+            creds,
             keyfile,
             index,
             dirty: false,
@@ -350,6 +376,31 @@ impl Repo {
             keyfile_checked: HashSet::new(),
             latency: Arc::default(),
         })
+    }
+
+    /// Passa a una configurazione nuova (backend aggiunti o tolti) senza chiedere di nuovo la
+    /// password: la chiave e le credenziali restano quelle aperte.
+    pub fn reconfigure(&mut self, cfg: Config) -> Result<()> {
+        if self.dirty {
+            bail!("ci sono modifiche all'indice non salvate: impossibile cambiare configurazione adesso");
+        }
+        cfg.validate()?;
+        let creds = Credentials::load(cfg.dir.as_deref(), self.keys.clone())?;
+        let backends = backend::open_all(&cfg, &creds);
+        parallel(&backends, |b| b.is_available());
+        self.cfg = cfg;
+        self.creds = creds;
+        self.backends = backends;
+        self.keyfile_checked.clear();
+        if let Some(index) = self.newer_index(self.index.generation)? {
+            self.index = index;
+        }
+        Ok(())
+    }
+
+    /// Le credenziali degli account (per aggiungerne o toglierne).
+    pub fn credentials(&self) -> &Arc<Credentials> {
+        &self.creds
     }
 
     pub fn index(&self) -> &Index {
@@ -1660,6 +1711,40 @@ impl Drop for Repo {
 }
 
 /// L'indice più recente che si riesce a leggere, da qualsiasi backend disponibile.
+const LOCAL_KEYFILE: &str = "cloudraid.key";
+
+/// La copia della chiave cifrata accanto alla configurazione, se c'è.
+fn load_local_keyfile(cfg: &Config) -> Option<KeyFile> {
+    let path = cfg.dir.as_ref()?.join(LOCAL_KEYFILE);
+    let data = fs::read(&path).ok()?;
+    match serde_json::from_slice(&data) {
+        Ok(kf) => Some(kf),
+        Err(_) => {
+            eprintln!("attenzione: {} danneggiato: uso la chiave dei backend", path.display());
+            None
+        }
+    }
+}
+
+/// Salva la copia della chiave cifrata accanto alla configurazione (solo il proprietario la legge;
+/// comunque senza password non serve a niente).
+fn save_local_keyfile(cfg: &Config, kf: &KeyFile) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(dir) = &cfg.dir else { return Ok(()) };
+    let path = dir.join(LOCAL_KEYFILE);
+    let tmp = dir.join(format!(".{LOCAL_KEYFILE}.{}.tmp", random_hex(4)));
+    let result = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&tmp)?;
+        f.write_all(&serde_json::to_vec_pretty(kf)?)?;
+        f.sync_all()?;
+        fs::rename(&tmp, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("impossibile salvare {}", path.display()))
+}
+
 /// Legge un frammento e ne controlla l'impronta.
 fn fetch_from(b: Option<&dyn Backend>, loc: &ShardLoc, key: &str) -> Shard {
     let Some(b) = b.filter(|b| b.is_available()) else {

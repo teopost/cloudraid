@@ -36,6 +36,7 @@
         <nav class="tabs" aria-label="Sezioni">
           <a href="#panoramica" data-view="panoramica">Panoramica</a>
           <a href="#file" data-view="file">File</a>
+          <a href="#spazi" data-view="spazi">Spazi</a>
           <a href="#manutenzione" data-view="manutenzione">Manutenzione</a>
           <a href="#attivita" data-view="attivita">Attività</a>
         </nav>
@@ -49,6 +50,7 @@
     <main class="container">
       <section id="view-panoramica" class="view" hidden></section>
       <section id="view-file" class="view" hidden></section>
+      <section id="view-spazi" class="view" hidden></section>
       <section id="view-manutenzione" class="view" hidden></section>
       <section id="view-attivita" class="view" hidden></section>
     </main>
@@ -61,6 +63,27 @@
       <div class="dialog-actions">
         <button value="no" class="btn btn-ghost">Annulla</button>
         <button value="si" id="confirm-ok" class="btn btn-danger">Conferma</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Procedura guidata per aggiungere uno spazio: fuori dalle viste, così gli aggiornamenti
+       periodici della pagina non cancellano quello che si sta scrivendo -->
+  <dialog id="wizard" class="dialog dialog-wide" aria-labelledby="wizard-title">
+    <div id="wizard-body"></div>
+  </dialog>
+
+  <dialog id="apps-dialog" class="dialog dialog-wide" aria-labelledby="apps-title">
+    <form id="apps-form" autocomplete="off">
+      <h3 id="apps-title">Collegamento con Google, Microsoft e Dropbox</h3>
+      <p class="muted">Per usare Google Drive, OneDrive o Dropbox, cloudraid deve essere registrato come applicazione presso
+        il provider. Si fa una volta sola, dal tuo account; i valori che ottieni vanno qui sotto. Non sono password:
+        servono solo a identificare cloudraid quando colleghi un account.</p>
+      <div id="apps-fields"></div>
+      <p id="apps-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-action="apps-close">Annulla</button>
+        <button type="submit" class="btn btn-primary">Salva</button>
       </div>
     </form>
   </dialog>

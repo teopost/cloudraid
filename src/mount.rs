@@ -62,6 +62,8 @@ pub struct MountOptions {
     pub threads: usize,
     /// Cartella di appoggio per i file in scrittura: se c'è, il mount è anche in scrittura.
     pub staging: Option<PathBuf>,
+    /// File di configurazione: se cambia (backend aggiunti o tolti dall'interfaccia) si rilegge.
+    pub config: Option<PathBuf>,
 }
 
 fn now() -> i64 {
@@ -1331,11 +1333,29 @@ pub fn mount(repo: Repo, opts: MountOptions) -> Result<()> {
     let mut session = fuser::Session::new(Fs(shared.clone()), mountpoint, &cfg)
         .with_context(|| format!("impossibile montare {} (serve /dev/fuse)", mountpoint.display()))?;
 
-    // aggiornamento dell'indice
+    // aggiornamento dell'indice (e della configurazione, se è cambiata)
     let refresher = shared.clone();
     let every = opts.refresh;
+    let config_path = opts.config.clone();
+    let modified = |p: &Option<PathBuf>| p.as_ref().and_then(|p| fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+    let mut config_seen = modified(&config_path);
     thread::spawn(move || loop {
         thread::sleep(every);
+        let now_modified = modified(&config_path);
+        if now_modified != config_seen {
+            if let Some(path) = &config_path {
+                let _gate = refresher.gate.lock().unwrap();
+                let mut repo = refresher.repo.write().unwrap();
+                match crate::Config::load(path).and_then(|cfg| repo.reconfigure(cfg)) {
+                    Ok(()) => {
+                        config_seen = now_modified;
+                        refresher.rebuild(&repo);
+                        eprintln!("configurazione riletta: {} backend", repo.config().backends.len());
+                    }
+                    Err(e) => eprintln!("attenzione: configurazione nuova non applicata: {e:#}"),
+                }
+            }
+        }
         match refresher.refresh() {
             Ok(true) => eprintln!("indice aggiornato alla generazione {}", refresher.tree().generation),
             Ok(false) => {}

@@ -18,9 +18,12 @@ pub struct Config {
     #[serde(default = "default_transfers")]
     pub transfers: usize,
     #[serde(default)]
-    pub rclone: RcloneConfig,
+    pub apps: AppsConfig,
     #[serde(rename = "backend")]
     pub backends: Vec<BackendConfig>,
+    /// Cartella della configurazione: lì stanno anche la copia della chiave e le credenziali cifrate.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
 }
 
 /// Dimensioni dei blocchi a lunghezza variabile (FastCDC), in byte.
@@ -42,29 +45,22 @@ fn default_transfers() -> usize {
     4
 }
 
-/// Come avviare rclone, usato dai backend di tipo `rclone`.
-#[derive(Deserialize, Clone, Debug)]
+/// Le applicazioni registrate presso i provider con login OAuth (una volta sola, vedi il README).
+/// Non sono segreti veri: per le applicazioni installate i provider li considerano pubblici.
+#[derive(Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
-pub struct RcloneConfig {
-    /// Eseguibile di rclone.
-    #[serde(default = "default_rclone")]
-    pub binary: String,
-    /// File di configurazione di rclone (predefinito: quello di rclone, ~/.config/rclone/rclone.conf).
+pub struct AppsConfig {
+    /// App key di un'app Dropbox con accesso "App folder".
     #[serde(default)]
-    pub config: Option<PathBuf>,
-    /// Opzioni aggiuntive per `rclone rcd`, per esempio `["--tpslimit", "10"]`.
+    pub dropbox_app_key: Option<String>,
+    /// Application (client) ID di un'app Microsoft Entra con i flussi client pubblici abilitati.
     #[serde(default)]
-    pub args: Vec<String>,
-}
-
-fn default_rclone() -> String {
-    "rclone".into()
-}
-
-impl Default for RcloneConfig {
-    fn default() -> Self {
-        RcloneConfig { binary: default_rclone(), config: None, args: Vec::new() }
-    }
+    pub onedrive_client_id: Option<String>,
+    /// Client OAuth Google di tipo "TV e dispositivi con input limitato".
+    #[serde(default)]
+    pub google_client_id: Option<String>,
+    #[serde(default)]
+    pub google_client_secret: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -77,22 +73,110 @@ pub struct BackendConfig {
     pub delay_ms: u64,
 }
 
+/// I tipi di backend. Password, chiavi segrete e token non stanno qui ma nelle credenziali
+/// cifrate accanto alla configurazione (vedi `credentials`).
 #[derive(Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum BackendKind {
     /// Una cartella locale (o un disco montato).
     Local { path: PathBuf },
-    /// Un remote di rclone con il suo percorso, per esempio `gdrive:cloudraid`:
-    /// Google Drive, OneDrive, Dropbox, MEGA, pCloud, SFTP, WebDAV, S3…
-    Rclone { remote: String },
+    /// Un server WebDAV (Nextcloud, ownCloud, NAS...): l'indirizzo della cartella del repository.
+    Webdav { url: String, user: String },
+    /// Un archivio compatibile S3 (AWS, Backblaze B2, Wasabi, MinIO...).
+    S3 {
+        /// Per esempio `https://s3.eu-central-003.backblazeb2.com`.
+        endpoint: String,
+        #[serde(default = "default_region")]
+        region: String,
+        bucket: String,
+        access_key: String,
+        /// Prefisso degli oggetti nel bucket (vuoto: tutto il bucket).
+        #[serde(default)]
+        prefix: String,
+        /// Indirizzi `endpoint/bucket/oggetto` (vero) o `bucket.endpoint/oggetto` (falso).
+        #[serde(default = "yes")]
+        path_style: bool,
+    },
+    /// Dropbox, nella cartella dell'app (`Applicazioni/<nome app>`).
+    Dropbox {
+        /// Sottocartella dentro la cartella dell'app (vuota: la cartella dell'app stessa).
+        #[serde(default)]
+        folder: String,
+        /// Solo per prove: indirizzo alternativo delle API.
+        #[serde(default)]
+        api_base: Option<String>,
+    },
+    /// OneDrive, nella cartella dell'app (`Applicazioni/<nome app>`).
+    Onedrive {
+        #[serde(default)]
+        folder: String,
+        #[serde(default)]
+        api_base: Option<String>,
+    },
+    /// Google Drive: una cartella nel Drive, visibile a cloudraid solo per i file che crea lui.
+    Gdrive {
+        #[serde(default = "default_gdrive_folder")]
+        folder: String,
+        /// Identificativo della cartella, scritto da cloudraid quando la crea.
+        #[serde(default)]
+        folder_id: Option<String>,
+        #[serde(default)]
+        api_base: Option<String>,
+    },
+}
+
+fn default_region() -> String {
+    "us-east-1".into()
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_gdrive_folder() -> String {
+    "cloudraid".into()
+}
+
+impl BackendKind {
+    /// Il nome del tipo, come nella configurazione.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            BackendKind::Local { .. } => "local",
+            BackendKind::Webdav { .. } => "webdav",
+            BackendKind::S3 { .. } => "s3",
+            BackendKind::Dropbox { .. } => "dropbox",
+            BackendKind::Onedrive { .. } => "onedrive",
+            BackendKind::Gdrive { .. } => "gdrive",
+        }
+    }
+}
+
+/// Un nome di backend valido: lettere minuscole, cifre, `-` e `_`, fino a 40 caratteri.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("impossibile leggere la configurazione {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("configurazione {} non valida", path.display()))?;
+        let mut cfg = Config::parse(&text).with_context(|| format!("configurazione {} non valida", path.display()))?;
+        cfg.dir = Some(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf());
+        Ok(cfg)
+    }
+
+    /// Legge e controlla una configurazione dal testo TOML (senza cartella).
+    pub fn parse(text: &str) -> Result<Config> {
+        if text.lines().any(|l| l.trim_start().starts_with("[rclone]") || l.replace(' ', "") == "type=\"rclone\"") {
+            bail!(
+                "rclone non è più usato: cloudraid parla direttamente con Google Drive, OneDrive, Dropbox, \
+                 WebDAV e S3. Togli la sezione [rclone] e i backend di tipo \"rclone\", poi riaggiungili \
+                 dall'interfaccia web"
+            );
+        }
+        let cfg: Config = toml::from_str(text)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -129,10 +213,19 @@ impl Config {
             if !names.insert(b.name.as_str()) {
                 bail!("nome di backend ripetuto: {}", b.name);
             }
-            if let BackendKind::Rclone { remote } = &b.kind {
-                if remote.trim().is_empty() {
-                    bail!("backend {}: remote vuoto", b.name);
+            match &b.kind {
+                BackendKind::Webdav { url, .. } if !(url.starts_with("https://") || url.starts_with("http://")) => {
+                    bail!("backend {}: l'indirizzo WebDAV deve cominciare con https:// o http://", b.name)
                 }
+                BackendKind::S3 { endpoint, bucket, .. } => {
+                    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+                        bail!("backend {}: l'endpoint S3 deve cominciare con https:// o http://", b.name);
+                    }
+                    if bucket.is_empty() {
+                        bail!("backend {}: bucket vuoto", b.name);
+                    }
+                }
+                _ => {}
             }
         }
         let c = self.chunk;

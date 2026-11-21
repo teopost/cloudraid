@@ -22,7 +22,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
 
+use crate::backend::oauth::{Link, LinkPrompt, LinkState, Provider};
+use crate::config::{BackendConfig, BackendKind};
 use crate::crypto::{self, random_hex, KeyFile};
+use crate::setup::{self, NewBackend};
 use crate::repo::{normalize, ScrubReport, LOCK_STALE_SECS};
 use crate::{Config, ReadStats, Repo};
 
@@ -161,6 +164,29 @@ struct Snapshot {
     dirs: Vec<String>,
     backends: Vec<BackendRow>,
     locks: Vec<LockRow>,
+    /// Applicazioni OAuth configurate (servono per collegare Dropbox, OneDrive e Google Drive).
+    apps: AppsView,
+    /// Dove si possono creare cartelle locali.
+    local_root: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct AppsView {
+    dropbox: bool,
+    onedrive: bool,
+    gdrive: bool,
+}
+
+/// La cartella sotto cui l'interfaccia può creare backend locali (quella montata nel container).
+fn local_root() -> String {
+    std::env::var("CLOUDRAID_LOCAL_ROOT").unwrap_or_else(|_| "/srv/cloudraid".into())
+}
+
+/// Un collegamento di account in corso: il flusso OAuth e, a collegamento fatto, il token.
+/// Restano sul server: il browser vede solo l'identificativo.
+struct PendingLink {
+    link: Link,
+    token: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -185,6 +211,8 @@ struct App {
     opening: Mutex<()>,
     /// Copia della chiave cifrata, per verificare la password anche mentre un'operazione occupa il repository.
     keyfile: Mutex<Option<KeyFile>>,
+    /// Collegamenti di account in corso.
+    links: Mutex<HashMap<String, PendingLink>>,
 }
 
 fn now() -> u64 {
@@ -198,7 +226,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 fn take_snapshot(repo: &Repo) -> Snapshot {
     let ix = repo.index();
     let cfg = repo.config();
+    let has = |p: Provider| p.client(&cfg.apps).is_ok();
     Snapshot {
+        apps: AppsView { dropbox: has(Provider::Dropbox), onedrive: has(Provider::OneDrive), gdrive: has(Provider::Google) },
+        local_root: local_root(),
         taken: now(),
         data_shards: cfg.data_shards,
         parity_shards: cfg.parity_shards,
@@ -350,6 +381,7 @@ impl App {
             failures: Mutex::new(0),
             opening: Mutex::new(()),
             keyfile: Mutex::new(None),
+            links: Mutex::new(HashMap::new()),
         }
     }
 
@@ -536,6 +568,49 @@ impl App {
                 });
                 let _ = req.respond(r);
             }
+            (Method::Post, "/api/link/start") => {
+                let resp = self.link_start(&mut req);
+                let _ = req.respond(resp);
+            }
+            (Method::Post, "/api/link/check") => {
+                let resp = self.link_check(&mut req);
+                let _ = req.respond(resp);
+            }
+            (Method::Post, "/api/backends") => {
+                let resp = self.add_backend(&mut req);
+                let _ = req.respond(resp);
+            }
+            (Method::Delete, "/api/backends") => {
+                let name = q.get("name").cloned().unwrap_or_default();
+                let config = self.opts.config.clone();
+                let r = self.start_job("remove-backend", format!("Rimozione di {name}"), move |repo, _| {
+                    repo.lock()?;
+                    setup::remove_backend(&config, repo, &name)?;
+                    Ok((format!("{name} tolto dalla configurazione"), None))
+                });
+                let _ = req.respond(r);
+            }
+            (Method::Post, "/api/apps") => {
+                let v = match read_json(&mut req) {
+                    Ok(v) => v,
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                let config = self.opts.config.clone();
+                let r = self.start_job("apps", "Impostazioni delle applicazioni".into(), move |repo, _| {
+                    let keys = ["dropbox_app_key", "onedrive_client_id", "google_client_id", "google_client_secret"];
+                    let values: Vec<(&str, String)> = keys
+                        .iter()
+                        .filter_map(|k| v.get(*k).and_then(Value::as_str).map(|s| (*k, s.to_string())))
+                        .collect();
+                    let refs: Vec<(&str, &str)> = values.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    setup::set_apps(&config, repo, &refs)?;
+                    Ok(("Impostazioni salvate".into(), None))
+                });
+                let _ = req.respond(r);
+            }
             (Method::Post, "/api/unlock") => {
                 let all = match read_json(&mut req) {
                     Ok(v) => v.get("all").and_then(Value::as_bool).unwrap_or(false),
@@ -646,6 +721,154 @@ impl App {
     }
 
     /// Avvia un'operazione in background. `work` riceve il repository e una funzione per l'avanzamento.
+    /// Le impostazioni delle app, senza aspettare un'operazione in corso.
+    fn apps_config(&self) -> Result<crate::config::AppsConfig, Resp> {
+        match self.repo.try_lock() {
+            Ok(g) => g.as_ref().map(|r| r.config().apps.clone()).ok_or_else(|| error(409, "repository non aperto")),
+            Err(_) => Err(error(409, "c'è un'operazione in corso: riprova quando finisce")),
+        }
+    }
+
+    /// Comincia il collegamento di un account Dropbox, OneDrive o Google.
+    fn link_start(&self, req: &mut Request) -> Resp {
+        let v = match read_json(req) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        let Some(provider) = v.get("provider").and_then(Value::as_str).and_then(Provider::parse) else {
+            return error(400, "servizio sconosciuto");
+        };
+        let apps = match self.apps_config() {
+            Ok(a) => a,
+            Err(r) => return r,
+        };
+        // solo per le prove: indirizzi finti al posto dei provider (mai in produzione)
+        let auth_base = v.get("auth_base").and_then(Value::as_str).filter(|_| std::env::var("CLOUDRAID_TEST_AUTH").is_ok());
+        match Link::start(provider, &apps, auth_base) {
+            Ok(link) => {
+                let id = random_hex(12);
+                let body = match &link.prompt {
+                    LinkPrompt::Device { url, code, expires_in } => {
+                        json!({"id": id, "kind": "device", "url": url, "code": code, "expires_in": expires_in})
+                    }
+                    LinkPrompt::PasteCode { url } => json!({"id": id, "kind": "paste", "url": url}),
+                };
+                let mut links = lock(&self.links);
+                // i collegamenti lasciati a metà scadono dopo mezz'ora
+                links.retain(|_, l| l.link.started.elapsed() < Duration::from_secs(1800));
+                links.insert(id, PendingLink { link, token: None });
+                json_resp(200, &body)
+            }
+            Err(e) => error(400, format!("{e:#}")),
+        }
+    }
+
+    /// Controlla un collegamento: per Dropbox con il codice incollato, per gli altri chiedendo al provider.
+    fn link_check(&self, req: &mut Request) -> Resp {
+        let v = match read_json(req) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        let id = v.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let code = v.get("code").and_then(Value::as_str).map(str::to_string);
+        // il controllo può fare una richiesta al provider: senza tenere bloccata la tabella
+        let mut pending = match lock(&self.links).remove(&id) {
+            Some(p) => p,
+            None => return error(404, "collegamento scaduto: ricomincia"),
+        };
+        if pending.token.is_some() {
+            lock(&self.links).insert(id, pending);
+            return json_resp(200, &json!({"state": "done"}));
+        }
+        let result = pending.link.check(code.as_deref());
+        let resp = match &result {
+            Ok(LinkState::Pending) => json_resp(200, &json!({"state": "pending"})),
+            Ok(LinkState::Done(_)) => json_resp(200, &json!({"state": "done"})),
+            Err(e) => json_resp(200, &json!({"state": "error", "message": format!("{e:#}")})),
+        };
+        match result {
+            Ok(LinkState::Done(token)) => {
+                pending.token = Some(token);
+                lock(&self.links).insert(id, pending);
+            }
+            Ok(LinkState::Pending) => {
+                lock(&self.links).insert(id, pending);
+            }
+            Err(_) => {}
+        }
+        resp
+    }
+
+    /// Aggiunge un backend (operazione in sottofondo: prova di scrittura e lettura compresa).
+    fn add_backend(self: &Arc<Self>, req: &mut Request) -> Resp {
+        let v = match read_json(req) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+        let name = s("name");
+        let kind = s("type");
+        let mut secrets: Vec<(String, String)> = Vec::new();
+        let kind = match kind.as_str() {
+            "local" => {
+                let root = local_root();
+                let path = s("path");
+                let ok = path.starts_with(&format!("{}/", root.trim_end_matches('/')))
+                    && !path.split('/').any(|p| p == ".." || p == ".")
+                    && path.len() > root.len() + 1;
+                if !ok {
+                    return error(400, format!("la cartella deve stare dentro {root}"));
+                }
+                BackendKind::Local { path: path.into() }
+            }
+            "webdav" => {
+                secrets.push(("password".into(), s("password")));
+                BackendKind::Webdav { url: s("url"), user: s("user") }
+            }
+            "s3" => {
+                secrets.push(("secret_key".into(), s("secret_key")));
+                let region = if s("region").is_empty() { "us-east-1".to_string() } else { s("region") };
+                BackendKind::S3 {
+                    endpoint: s("endpoint"),
+                    region,
+                    bucket: s("bucket"),
+                    access_key: s("access_key"),
+                    prefix: s("prefix"),
+                    path_style: v.get("path_style").and_then(Value::as_bool).unwrap_or(true),
+                }
+            }
+            "dropbox" | "onedrive" | "gdrive" => {
+                let link_id = s("link_id");
+                let token = lock(&self.links).get(&link_id).and_then(|l| l.token.clone());
+                let Some(token) = token else {
+                    return error(400, "prima collega l'account");
+                };
+                secrets.push(("refresh_token".into(), token));
+                let api_base = Some(s("api_base")).filter(|a| !a.is_empty() && std::env::var("CLOUDRAID_TEST_AUTH").is_ok());
+                match kind.as_str() {
+                    "dropbox" => BackendKind::Dropbox { folder: s("folder"), api_base },
+                    "onedrive" => BackendKind::Onedrive { folder: s("folder"), api_base },
+                    _ => BackendKind::Gdrive {
+                        folder: if s("folder").is_empty() { "cloudraid".into() } else { s("folder") },
+                        folder_id: None,
+                        api_base,
+                    },
+                }
+            }
+            _ => return error(400, "tipo di spazio sconosciuto"),
+        };
+        let config = self.opts.config.clone();
+        let link_id = s("link_id");
+        let app = self.clone();
+        let label = format!("Aggiunta di {name}");
+        self.start_job("add-backend", label, move |repo, _| {
+            let nb = NewBackend { config: BackendConfig { name: name.clone(), kind, delay_ms: 0 }, secrets };
+            setup::add_backend(&config, repo, nb)?;
+            lock(&app.links).remove(&link_id);
+            Ok((format!("{name} aggiunto e provato: ora riceve i frammenti nuovi. Con \"Ribilancia\" gli passi anche una parte di quelli esistenti"), None))
+        })
+    }
+
     fn start_job<F>(self: &Arc<Self>, kind: &str, label: String, work: F) -> Resp
     where
         F: FnOnce(&mut Repo, &dyn Fn(u64, u64)) -> Result<(String, Option<ReportView>), JobError> + Send + 'static,

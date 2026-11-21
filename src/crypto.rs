@@ -28,6 +28,8 @@ pub struct KeyFile {
 pub struct Keys {
     data: [u8; 32],
     id: [u8; 32],
+    /// Chiave delle credenziali locali (password e token degli account), mai usata sui backend.
+    secrets: [u8; 32],
 }
 
 impl Keys {
@@ -35,7 +37,15 @@ impl Keys {
         Keys {
             data: blake3::derive_key("cloudraid v1 data encryption", master),
             id: blake3::derive_key("cloudraid v1 chunk id", master),
+            secrets: blake3::derive_key("cloudraid v1 local credentials", master),
         }
+    }
+
+    /// Chiavi casuali usa e getta (per strutture che ne chiedono una ma non cifreranno niente).
+    pub fn ephemeral() -> Keys {
+        let mut master = [0u8; 32];
+        OsRng.fill_bytes(&mut master);
+        Keys::from_master(&master)
     }
 
     /// Cifra con XChaCha20-Poly1305: il risultato è nonce || testo cifrato || tag.
@@ -45,6 +55,15 @@ impl Keys {
 
     pub fn open(&self, sealed: &[u8]) -> Result<Vec<u8>> {
         open(&self.data, sealed)
+    }
+
+    /// Cifra le credenziali locali (chiave separata da quella dei dati).
+    pub fn seal_secret(&self, plain: &[u8]) -> Vec<u8> {
+        seal(&self.secrets, plain)
+    }
+
+    pub fn open_secret(&self, sealed: &[u8]) -> Result<Vec<u8>> {
+        open(&self.secrets, sealed)
     }
 
     /// Identificativo di un blocco: hash con chiave del contenuto in chiaro.
