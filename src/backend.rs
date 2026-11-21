@@ -33,6 +33,10 @@ pub trait Backend: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     /// Chiavi contenute in una "cartella" (non ricorsivo), nella forma `dir/nome`.
     fn list(&self, dir: &str) -> Result<Vec<String>>;
+    /// Tipo di backend, per l'interfaccia ("local", "rclone").
+    fn kind(&self) -> &'static str;
+    /// Dimentica la disponibilità memorizzata: alla prossima domanda si verifica di nuovo.
+    fn refresh(&self) {}
 }
 
 /// Apre tutti i backend della configurazione; avvia rclone solo se serve.
@@ -84,6 +88,10 @@ impl Local {
 impl Backend for Local {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn kind(&self) -> &'static str {
+        "local"
     }
 
     fn location(&self) -> String {
@@ -352,6 +360,14 @@ impl Rclone {
 impl Backend for Rclone {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn kind(&self) -> &'static str {
+        "rclone"
+    }
+
+    fn refresh(&self) {
+        *self.available.lock().unwrap() = None;
     }
 
     fn location(&self) -> String {

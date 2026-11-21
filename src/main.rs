@@ -50,6 +50,18 @@ enum Cmd {
         #[arg(long)]
         repair: bool,
     },
+    /// Avvia l'interfaccia web di amministrazione
+    Serve {
+        /// Indirizzo e porta di ascolto
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+        /// File con la cronologia delle operazioni
+        #[arg(long, env = "CLOUDRAID_STATE", default_value = "/config/web-state.json")]
+        state: PathBuf,
+        /// Cookie di sessione anche senza HTTPS (solo per provare in locale)
+        #[arg(long)]
+        insecure_cookie: bool,
+    },
     /// Cancella i lock lasciati da processi interrotti
     Unlock {
         /// Cancella anche i lock non ancora scaduti (solo se sei sicuro che nessun processo stia lavorando)
@@ -194,6 +206,10 @@ fn now() -> u64 {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // il server web legge la configurazione al primo login: può partire anche prima che esista
+    if let Cmd::Serve { listen, state, insecure_cookie } = cli.cmd {
+        return cloudraid::web::serve(cloudraid::web::ServeOptions { listen, config: cli.config, state, insecure_cookie });
+    }
     let cfg = Config::load(&cli.config)?;
     if let Cmd::Init = cli.cmd {
         let repo = Repo::init(cfg.clone(), &password(true)?)?;
@@ -207,7 +223,7 @@ fn run(cli: Cli) -> Result<()> {
         repo.lock()?;
     }
     let result = match cli.cmd {
-        Cmd::Init => unreachable!(),
+        Cmd::Init | Cmd::Serve { .. } => unreachable!(),
         Cmd::Put { src, dest } => cmd_put(&mut repo, &src, dest),
         Cmd::Get { path, dest } => cmd_get(&repo, &path, dest),
         Cmd::Ls { path } => {

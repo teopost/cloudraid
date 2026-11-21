@@ -32,6 +32,8 @@ pub struct Repo {
     cfg: Config,
     backends: Vec<Box<dyn Backend>>,
     keys: Keys,
+    /// La chiave principale cifrata: serve per verificare la password senza rileggere i backend.
+    keyfile: KeyFile,
     index: Index,
     dirty: bool,
     /// Frammenti da cancellare dopo il prossimo salvataggio riuscito dell'indice:
@@ -68,6 +70,8 @@ pub struct ScrubReport {
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
     pub name: String,
+    /// "local" o "rclone".
+    pub kind: String,
     pub location: String,
     pub available: bool,
     pub shards: u64,
@@ -154,6 +158,7 @@ impl Repo {
             cfg,
             backends,
             keys,
+            keyfile: kf,
             index: Index::default(),
             dirty: true,
             pending_deletes: Vec::new(),
@@ -173,43 +178,64 @@ impl Repo {
             bail!("nessun backend disponibile");
         }
 
-        let mut keys = None;
+        let mut unlocked = None;
         for b in backends.iter().filter(|b| b.is_available()) {
             let Ok(Some(data)) = b.get(KEYFILE) else { continue };
             let Ok(kf) = serde_json::from_slice::<KeyFile>(&data) else {
                 eprintln!("attenzione: {KEYFILE} danneggiato sul backend {}", b.name());
                 continue;
             };
-            keys = Some(crypto::unlock(&kf, password)?);
+            unlocked = Some((crypto::unlock(&kf, password)?, kf));
             break;
         }
-        let keys = keys.ok_or_else(|| {
+        let (keys, keyfile) = unlocked.ok_or_else(|| {
             anyhow!("nessun backend disponibile contiene la chiave del repository (serve `cloudraid init`?)")
         })?;
 
-        // l'indice più recente che si riesce a leggere, da qualsiasi backend
-        let listed = parallel(&backends, |b| if b.is_available() { b.list(INDEX_DIR).unwrap_or_default() } else { Vec::new() });
-        let mut candidates: Vec<(u64, usize, String)> = listed
-            .into_iter()
-            .enumerate()
-            .flat_map(|(i, keys)| keys.into_iter().filter_map(move |k| parse_index_key(&k).map(|g| (g, i, k))))
-            .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        let index = candidates
-            .iter()
-            .find_map(|(generation, i, key)| {
-                let sealed = backends[*i].get(key).ok()??;
-                let plain = keys.open(&sealed).ok()?;
-                let index: Index = serde_json::from_slice(&plain).ok()?;
-                (index.generation == *generation).then_some(index)
-            })
-            .ok_or_else(|| anyhow!("indice non trovato su nessun backend disponibile"))?;
-
-        Ok(Repo { cfg, backends, keys, index, dirty: false, pending_deletes: Vec::new(), lock: None })
+        let index = load_latest_index(&backends, &keys)?;
+        Ok(Repo { cfg, backends, keys, keyfile, index, dirty: false, pending_deletes: Vec::new(), lock: None })
     }
 
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub fn keyfile(&self) -> &KeyFile {
+        &self.keyfile
+    }
+
+    /// La password apre questo repository? Non tocca i backend.
+    pub fn verify_password(&self, password: &str) -> bool {
+        crypto::unlock(&self.keyfile, password).is_ok()
+    }
+
+    /// Per i processi che restano aperti a lungo: verifica di nuovo i backend e rilegge l'indice
+    /// se un altro processo ne ha salvato uno più recente.
+    pub fn reload(&mut self) -> Result<()> {
+        if self.dirty {
+            bail!("ci sono modifiche non salvate: impossibile rileggere l'indice");
+        }
+        for b in &self.backends {
+            b.refresh();
+        }
+        parallel(&self.backends, |b| b.is_available());
+        let index = load_latest_index(&self.backends, &self.keys)?;
+        if index.generation >= self.index.generation {
+            self.index = index;
+        }
+        Ok(())
+    }
+
+    /// Abbandona le modifiche non salvate e torna all'indice dei backend.
+    pub fn discard(&mut self) -> Result<()> {
+        self.dirty = false;
+        self.pending_deletes.clear();
+        self.index.generation = 0;
+        self.reload()
     }
 
     fn backend(&self, name: &str) -> Option<&dyn Backend> {
@@ -304,6 +330,15 @@ impl Repo {
         }
         let t = mine.time;
         self.lock = Some((mine, t));
+        // chi prende il lock lavora sull'indice più recente: un altro processo potrebbe averlo
+        // cambiato dopo la nostra apertura (si eviterebbe di sovrascrivere le sue modifiche)
+        if !self.dirty {
+            if let Ok(index) = load_latest_index(&self.backends, &self.keys) {
+                if index.generation > self.index.generation {
+                    self.index = index;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -667,6 +702,7 @@ impl Repo {
             .iter()
             .map(|b| BackendStatus {
                 name: b.name().to_string(),
+                kind: b.kind().to_string(),
                 location: b.location(),
                 available: b.is_available(),
                 shards: 0,
@@ -688,6 +724,11 @@ impl Repo {
     /// sul backend originale se è disponibile, altrimenti su un altro che non abbia già
     /// un frammento dello stesso blocco.
     pub fn scrub(&mut self, repair: bool) -> Result<ScrubReport> {
+        self.scrub_with_progress(repair, &mut |_, _| {})
+    }
+
+    /// Come `scrub`, chiamando `progress(blocchi controllati, totale)` dopo ogni gruppo.
+    pub fn scrub_with_progress(&mut self, repair: bool, progress: &mut dyn FnMut(u64, u64)) -> Result<ScrubReport> {
         let mut report = ScrubReport::default();
         let mut load: HashMap<String, u64> = HashMap::new();
         for e in self.index.chunks.values() {
@@ -696,6 +737,8 @@ impl Repo {
             }
         }
         let ids: Vec<String> = self.index.chunks.keys().cloned().collect();
+        let total = ids.len() as u64;
+        progress(0, total);
         for group in ids.chunks(self.cfg.transfers) {
             let checked = parallel(group, |id| {
                 let e = &self.index.chunks[id];
@@ -708,6 +751,7 @@ impl Repo {
             if repair {
                 self.refresh_lock();
             }
+            progress(report.chunks, total);
         }
 
         let lost: BTreeSet<&String> = report.lost_chunks.iter().collect();
@@ -817,6 +861,26 @@ impl Drop for Repo {
     fn drop(&mut self) {
         self.unlock();
     }
+}
+
+/// L'indice più recente che si riesce a leggere, da qualsiasi backend disponibile.
+fn load_latest_index(backends: &[Box<dyn Backend>], keys: &Keys) -> Result<Index> {
+    let listed = parallel(backends, |b| if b.is_available() { b.list(INDEX_DIR).unwrap_or_default() } else { Vec::new() });
+    let mut candidates: Vec<(u64, usize, String)> = listed
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, keys)| keys.into_iter().filter_map(move |k| parse_index_key(&k).map(|g| (g, i, k))))
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates
+        .iter()
+        .find_map(|(generation, i, key)| {
+            let sealed = backends[*i].get(key).ok()??;
+            let plain = keys.open(&sealed).ok()?;
+            let index: Index = serde_json::from_slice(&plain).ok()?;
+            (index.generation == *generation).then_some(index)
+        })
+        .ok_or_else(|| anyhow!("indice non trovato su nessun backend disponibile"))
 }
 
 fn prune_indexes(b: &dyn Backend) -> Result<()> {

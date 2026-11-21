@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod erasure;
 pub mod index;
 pub mod repo;
+pub mod web;
 
 pub use config::{BackendConfig, BackendKind, ChunkConfig, Config, RcloneConfig};
 pub use repo::{ReadStats, Repo, ScrubReport};

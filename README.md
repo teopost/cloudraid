@@ -8,7 +8,7 @@ Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di d
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: fase 2 (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: fase 2 + interfaccia web (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -47,6 +47,27 @@ errori temporanei vengono ripetute fino a 4 volte.
 Un backend è **disponibile** se la sua cartella del repository esiste. Una cartella sparita (account perso, disco
 smontato) si tratta come un disco guasto.
 
+## Interfaccia web
+
+`cloudraid serve` avvia un'interfaccia di amministrazione: stato dei backend e della ridondanza, file (sfoglia, cerca,
+carica anche trascinando, scarica, elimina), verifica e riparazione con l'avanzamento, lock, cronologia delle operazioni.
+
+- **Accesso con la password del repository.** Il server parte bloccato e non salva la password da nessuna parte: il primo
+  accesso apre il repository (con i backend cloud può richiedere qualche decina di secondi), che poi resta aperto in memoria
+  fino al riavvio del container. Sessioni con cookie `HttpOnly`, `Secure`, `SameSite=Strict`: scadono dopo 1 ora di inattività
+  e comunque dopo 12 ore. I tentativi sbagliati vengono rallentati.
+- **Un'operazione alla volta**, in background (scrub, riparazione, caricamenti, eliminazioni), con il lock del repository come
+  la riga di comando. Prima di scrivere il server rilegge l'indice: le modifiche fatte nel frattempo dalla riga di comando non
+  vanno perse. «Ricontrolla» rilegge backend e indice anche a mano.
+- Lo scaricamento ricostruisce e decifra il file sul server; durante un'operazione lunga viene rifiutato (409).
+- Protezioni: richieste di modifica solo con l'intestazione `X-Cloudraid: 1` (CSRF), Content-Security-Policy senza script né stili
+  inline, nessuna libreria esterna.
+- Cronologia delle operazioni in `config/web-state.json` (niente segreti).
+
+Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@file`), su `https://<LAN_IP>/cloudraid/`
+(certificato non valido per un IP: il browser avvisa, come per la dashboard di Traefik) e, se impostato, su
+`https://<CLOUDRAID_HOST>/` (serve un nome che lo risolva: record DNS o file hosts).
+
 ## Installazione sul server (Docker)
 
 Il progetto sta in `/srv/docker/cloudraid`, come le altre app. L'immagine contiene cloudraid e rclone 1.71;
@@ -57,12 +78,14 @@ così i percorsi relativi funzionano come con un programma installato.
 ```bash
 cd /srv/docker/cloudraid
 make build                                   # costruisce l'immagine cloudraid:local
+( umask 077; cp .env.example .env )          # poi controlla LAN_IP
 install -d -m 700 config
 cp cloudraid.example.toml config/cloudraid.toml   # poi adatta i backend
 # solo i remote di rclone che servono (rclone ci riscrive i token rinnovati):
 ( umask 077; awk '/^\[/{p=($0=="[gdrive]"||$0=="[dropbox]")} p' /root/.config/rclone/rclone.conf > config/rclone.conf )
 ./cloudraid init
 ./cloudraid status
+docker compose up -d web                     # interfaccia web: https://<LAN_IP>/cloudraid/
 ```
 
 Facoltativo: `CLOUDRAID_PASSWORD` in `.env` (`chmod 600`, modello in `.env.example`) per gli usi non interattivi,
@@ -136,6 +159,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 |---|---|---|
 | 1 | CLI `init/put/get/ls/rm/status/scrub`, cifratura, Reed-Solomon, backend locali, test | fatta |
 | 2 | Backend rclone (tutti i provider di rclone), trasferimenti in parallelo, lock, `unlock`, immagine Docker | fatta |
+| 3a | Interfaccia web di amministrazione (`serve`) dietro Traefik, solo LAN | fatta |
 | 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
 | 3 | Mount FUSE in sola lettura con cache locale | |
 | 4 | Mount in scrittura, pulizia dei frammenti orfani, ribilanciamento | |

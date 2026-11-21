@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <base href="{{BASE}}">
+  <title>cloudraid</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <!-- Accesso -->
+  <div id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="off">
+      <div class="brand brand-lg">
+        <img src="favicon.svg" alt="" width="40" height="40">
+        <span>cloudraid</span>
+      </div>
+      <p class="muted">Archivio cifrato con ridondanza distribuita.<br>Accedi con la password del repository.</p>
+      <label for="password" class="field-label">Password del repository</label>
+      <input id="password" name="password" type="password" required autocomplete="current-password" autofocus>
+      <p id="login-error" class="form-error" role="alert" hidden></p>
+      <button id="login-btn" type="submit" class="btn btn-primary btn-block">Accedi</button>
+      <p id="login-hint" class="hint" hidden></p>
+    </form>
+  </div>
+
+  <!-- Applicazione -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="#panoramica">
+          <img src="favicon.svg" alt="" width="26" height="26">
+          <span>cloudraid</span>
+        </a>
+        <nav class="tabs" aria-label="Sezioni">
+          <a href="#panoramica" data-view="panoramica">Panoramica</a>
+          <a href="#file" data-view="file">File</a>
+          <a href="#manutenzione" data-view="manutenzione">Manutenzione</a>
+          <a href="#attivita" data-view="attivita">Attività</a>
+        </nav>
+        <div class="topbar-right">
+          <span id="busy" class="busy" hidden><span class="spinner" aria-hidden="true"></span><span id="busy-label"></span></span>
+          <button id="logout" class="btn btn-ghost btn-sm" type="button">Esci</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="container">
+      <section id="view-panoramica" class="view" hidden></section>
+      <section id="view-file" class="view" hidden></section>
+      <section id="view-manutenzione" class="view" hidden></section>
+      <section id="view-attivita" class="view" hidden></section>
+    </main>
+  </div>
+
+  <dialog id="confirm" class="dialog">
+    <form method="dialog">
+      <h3 id="confirm-title"></h3>
+      <p id="confirm-text" class="muted"></p>
+      <div class="dialog-actions">
+        <button value="no" class="btn btn-ghost">Annulla</button>
+        <button value="si" id="confirm-ok" class="btn btn-danger">Conferma</button>
+      </div>
+    </form>
+  </dialog>
+
+  <input id="upload-input" type="file" multiple hidden>
+  <div id="dropzone" class="dropzone" hidden><div>Rilascia i file per caricarli in <strong id="drop-target"></strong></div></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

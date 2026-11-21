@@ -16,7 +16,7 @@ help: ## Mostra questo aiuto
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-8s\033[0m %s\n", $$1, $$2}'
 
 build: ## Costruisce l'immagine Docker (cloudraid + rclone)
-	docker compose --profile cli build
+	docker compose build web
 
 test: ## Lancia tutti i test
 	@mkdir -p $(CACHE)

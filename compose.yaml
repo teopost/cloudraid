@@ -1,19 +1,55 @@
-# cloudraid è un programma a riga di comando, non un servizio sempre acceso:
-# si lancia con lo script ./cloudraid (es. `./cloudraid status`), che usa questo compose.
-# Il profilo "cli" evita che `docker compose up -d` lo avvii insieme alle altre app.
+# cloudraid: interfaccia web di amministrazione (servizio `web`) e riga di comando (servizio `cloudraid`).
+#
+# - web: sempre acceso, dietro Traefik, solo dalla LAN (middleware lan-only@file). Risponde su
+#   https://<LAN_IP>/cloudraid/ e, se c'è un nome che lo risolve, su https://<CLOUDRAID_HOST>/.
+#   Il login usa la password del repository, che resta solo in memoria: dopo un riavvio serve un nuovo accesso.
+# - cloudraid: la riga di comando, a richiesta, con lo script ./cloudraid (es. `./cloudraid status`).
+#   Il profilo "cli" evita che `docker compose up -d` lo avvii.
+#
+# In .env (vedi .env.example): LAN_IP, facoltativi CLOUDRAID_HOST e CLOUDRAID_PASSWORD (solo per la riga di comando).
 services:
-  cloudraid:
+  web:
     build: .
     image: cloudraid:local
-    profiles: ["cli"]
+    container_name: cloudraid-web
+    command: ["serve", "--listen", "0.0.0.0:8080"]
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Rome
+    volumes:
+      # cloudraid.toml, rclone.conf (rclone ci riscrive i token rinnovati), web-state.json (cronologia)
+      - ./config:/config
+      # backend locali: stesso percorso dentro e fuori dal container
+      - /srv/cloudraid:/srv/cloudraid
+    networks: [proxy]
+    # niente porte pubblicate: si passa solo da Traefik
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ok <&3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.routers.cloudraid.rule=Host(`${CLOUDRAID_HOST:-cloudraid.invalid}`) || (Host(`${LAN_IP:?imposta LAN_IP in .env}`) && PathPrefix(`/cloudraid`))
+      - traefik.http.routers.cloudraid.entrypoints=websecure
+      - traefik.http.routers.cloudraid.middlewares=lan-only@file,security-headers@file,cloudraid-prefix
+      - traefik.http.middlewares.cloudraid-prefix.stripprefix.prefixes=/cloudraid
+      - traefik.http.services.cloudraid.loadbalancer.server.port=8080
+
+  cloudraid:
+    image: cloudraid:local
     pull_policy: never     # immagine solo locale: `make build`
+    profiles: ["cli"]
     env_file:
       - path: .env          # facoltativo: CLOUDRAID_PASSWORD per gli usi non interattivi
         required: false
     environment:
       TZ: Europe/Rome
     volumes:
-      # cloudraid.toml e rclone.conf (rclone ci riscrive i token rinnovati)
       - ./config:/config
-      # backend locali: stesso percorso dentro e fuori dal container
       - /srv/cloudraid:/srv/cloudraid
+
+networks:
+  proxy:
+    external: true
