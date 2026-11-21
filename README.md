@@ -46,6 +46,9 @@ file → blocchi a lunghezza variabile (FastCDC, ~4 MiB) → deduplicazione
 | `onedrive` | la cartella dell'app (`Applicazioni/<app>`) | `folder` facoltativa | token, dal collegamento dell'account |
 | `gdrive` | una cartella nel Drive, scope `drive.file` | `folder`, `folder_id` | token, dal collegamento dell'account |
 
+**Istruzioni passo passo per ogni servizio** (Koofr, Nextcloud, Backblaze B2, Cloudflare R2, Oracle, Google Drive,
+OneDrive, Dropbox...), con i piani gratuiti e i servizi non utilizzabili: [docs/servizi.md](docs/servizi.md).
+
 Il modo semplice per aggiungere un backend è l'interfaccia web, pagina **Spazi**, "Aggiungi uno spazio": si sceglie il
 servizio, si compilano pochi campi (o si collega l'account), cloudraid crea la cartella, scrive, rilegge, elenca e
 cancella un file di prova, e **solo se tutto va bene** salva le credenziali cifrate e aggiunge il backend a
