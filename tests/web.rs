@@ -54,6 +54,7 @@ impl Lab {
             config: cfg_path,
             state: tmp.path().join("web-state.json"),
             insecure_cookie: true,
+            watch: std::time::Duration::from_millis(200),
         })
         .unwrap();
         Lab { tmp, cfg, base: format!("http://{addr}") }
@@ -328,4 +329,25 @@ fn un_operazione_alla_volta() {
     }
     let id = first.json()["job"]["id"].as_str().unwrap().to_string();
     assert_eq!(wait_job(&lab, &cookie, &id)["state"], "ok");
+}
+
+#[test]
+fn file_aggiunti_da_fuori_compaiono_da_soli() {
+    let lab = Lab::new();
+    let cookie = login(&lab);
+    // un altro processo (il mount o la riga di comando) aggiunge un file; l'interfaccia non fa niente
+    {
+        let mut cli = Repo::open(lab.cfg.clone(), PW).unwrap();
+        cli.lock().unwrap();
+        let p = lab.tmp.path().join("crm.db");
+        fs::write(&p, random("crm", 50_000)).unwrap();
+        cli.put_file(&p, "crm.db").unwrap();
+        cli.save().unwrap();
+    }
+    let has = |s: &Value| s["snapshot"]["files"].as_array().unwrap().iter().any(|f| f["path"] == "crm.db");
+    let start = std::time::Instant::now();
+    while !has(&status(&lab, &cookie)) {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "il file aggiunto da fuori non compare");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }

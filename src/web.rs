@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -47,13 +47,28 @@ pub struct ServeOptions {
     pub state: PathBuf,
     /// Cookie senza `Secure`: solo per provare in locale senza HTTPS.
     pub insecure_cookie: bool,
+    /// Ogni quanto controllare se un altro processo (mount, riga di comando) ha salvato un indice
+    /// più recente, mentre qualcuno usa l'interfaccia.
+    pub watch: Duration,
 }
+
+/// Intervallo predefinito del controllo dell'indice.
+pub const WATCH_EVERY: Duration = Duration::from_secs(15);
+
+/// Il controllo dell'indice si fa solo se qualcuno ha usato l'interfaccia negli ultimi minuti:
+/// niente richieste ai servizi cloud quando la pagina non è aperta.
+const WATCH_ACTIVE: Duration = Duration::from_secs(5 * 60);
 
 /// Avvia il server e restituisce l'indirizzo su cui ascolta (utile ai test con la porta 0).
 pub fn start(opts: ServeOptions) -> Result<SocketAddr> {
     let server = Server::http(&opts.listen).map_err(|e| anyhow!("impossibile ascoltare su {}: {e}", opts.listen))?;
     let addr = server.server_addr().to_ip().ok_or_else(|| anyhow!("indirizzo di ascolto non IP"))?;
     let app = Arc::new(App::new(opts));
+    let watcher = app.clone();
+    thread::spawn(move || loop {
+        thread::sleep(watcher.opts.watch);
+        watcher.watch_index();
+    });
     thread::spawn(move || {
         for req in server.incoming_requests() {
             let app = app.clone();
@@ -744,6 +759,33 @@ impl App {
                     Err((500, msg))
                 }
             }
+        }
+    }
+
+    /// Se un altro processo ha salvato un indice più recente (un file copiato nella cartella montata,
+    /// un comando), lo rilegge e aggiorna lo stato mostrato. Salta il giro se è in corso
+    /// un'operazione (che rilegge da sé) o se nessuno usa l'interfaccia.
+    fn watch_index(&self) {
+        let active = lock(&self.sessions).values().any(|s| s.seen.elapsed() < WATCH_ACTIVE);
+        if !active {
+            return;
+        }
+        let mut guard = match self.repo.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let Some(repo) = guard.as_mut() else { return };
+        if repo.holds_lock() {
+            return;
+        }
+        let generation = repo.index().generation;
+        match repo.reload() {
+            Ok(()) if repo.index().generation != generation => {
+                *lock(&self.snapshot) = Some(take_snapshot(repo));
+            }
+            Ok(()) => {}
+            Err(e) => eprintln!("attenzione: controllo dell'indice: {e:#}"),
         }
     }
 

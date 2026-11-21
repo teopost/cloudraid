@@ -110,7 +110,8 @@ carica anche trascinando, scarica, elimina), verifica e riparazione con l'avanza
   e comunque dopo 12 ore. I tentativi sbagliati vengono rallentati.
 - **Un'operazione alla volta**, in background (scrub, riparazione, caricamenti, eliminazioni), con il lock del repository come
   la riga di comando. Prima di scrivere il server rilegge l'indice: le modifiche fatte nel frattempo dalla riga di comando non
-  vanno perse. «Ricontrolla» rilegge backend e indice anche a mano.
+  vanno perse. Mentre qualcuno usa l'interfaccia, ogni 15 s controlla se il mount o la riga di comando hanno salvato un indice
+  più recente: i file copiati nella cartella montata compaiono da soli. «Ricontrolla» rilegge backend e indice anche a mano.
 - Lo scaricamento ricostruisce e decifra il file sul server; durante un'operazione lunga viene rifiutato (409).
 - Protezioni: richieste di modifica solo con l'intestazione `X-Cloudraid: 1` (CSRF), Content-Security-Policy senza script né stili
   inline, nessuna libreria esterna.

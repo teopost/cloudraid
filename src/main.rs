@@ -247,7 +247,13 @@ fn now() -> u64 {
 fn run(cli: Cli) -> Result<()> {
     // il server web legge la configurazione al primo login: può partire anche prima che esista
     if let Cmd::Serve { listen, state, insecure_cookie } = cli.cmd {
-        return cloudraid::web::serve(cloudraid::web::ServeOptions { listen, config: cli.config, state, insecure_cookie });
+        return cloudraid::web::serve(cloudraid::web::ServeOptions {
+            listen,
+            config: cli.config,
+            state,
+            insecure_cookie,
+            watch: cloudraid::web::WATCH_EVERY,
+        });
     }
     let cfg = Config::load(&cli.config)?;
     if let Cmd::Init = cli.cmd {
