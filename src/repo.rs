@@ -335,6 +335,23 @@ pub struct BackendStatus {
     pub same_device: Vec<String>,
 }
 
+/// Quanto è robusta la configurazione, per gli avvisi dell'interfaccia.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Reliability {
+    /// Backend attivi (disponibili e non in dismissione) e quanti ne servono per lo schema pieno.
+    pub active: usize,
+    pub wanted: usize,
+    /// Si può ancora scrivere (almeno m + 1 backend attivi)?
+    pub writable: bool,
+    /// Le scritture nuove reggono anche il guasto di un disco (al massimo m frammenti per disco)?
+    pub writes_survive_disk_loss: bool,
+    /// Blocchi già scritti con più di m frammenti sullo stesso disco, e i backend di quel disco.
+    pub crowded_chunks: u64,
+    pub crowded_backends: Vec<String>,
+    /// Backend attivi di cui non si conosce lo spazio (né dal servizio né da un limite).
+    pub unknown_space: Vec<String>,
+}
+
 /// Il contenuto di un file `locks/<id>.json`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LockInfo {
@@ -1197,6 +1214,46 @@ impl Repo {
     fn mark_full(&self, bi: usize) {
         let mut cache = self.space.lock().unwrap();
         cache.by_name.entry(self.backends[bi].name().to_string()).or_default().full = true;
+    }
+
+    /// Analisi dell'affidabilità: backend attivi, blocchi con troppi frammenti su un disco, scritture
+    /// nuove protette dal guasto di un disco, spazi di capienza non nota.
+    pub fn reliability(&self) -> Reliability {
+        let m = self.cfg.parity_shards;
+        let writable = self.writable();
+        let devices = self.devices();
+        let device = |b: usize| devices[b];
+        let pos: HashMap<&str, usize> = self.backends.iter().enumerate().map(|(i, b)| (b.name(), i)).collect();
+        let mut crowded_chunks = 0;
+        let mut crowded: BTreeSet<String> = BTreeSet::new();
+        for c in self.index.chunks.values() {
+            let mut per_device: HashMap<u64, Vec<&str>> = HashMap::new();
+            for l in &c.shards {
+                if let Some(d) = pos.get(l.backend.as_str()).and_then(|&b| devices[b]) {
+                    per_device.entry(d).or_default().push(&l.backend);
+                }
+            }
+            let mut bad = false;
+            for names in per_device.values().filter(|v| v.len() > c.m as usize) {
+                bad = true;
+                crowded.extend(names.iter().map(|n| n.to_string()));
+            }
+            crowded_chunks += bad as u64;
+        }
+        let fm = self.free_map();
+        Reliability {
+            active: writable.len(),
+            wanted: self.cfg.data_shards + m,
+            writable: writable.len() > m,
+            writes_survive_disk_loss: pick_spread(&writable, m + 1, m, &device).is_some(),
+            crowded_chunks,
+            crowded_backends: crowded.into_iter().collect(),
+            unknown_space: writable
+                .iter()
+                .filter(|&&b| fm[&b] >= UNLIMITED / 2)
+                .map(|&b| self.backends[b].name().to_string())
+                .collect(),
+        }
     }
 
     /// Quanti byte di file si possono ancora caricare, stimati simulando la distribuzione dei

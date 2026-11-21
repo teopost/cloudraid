@@ -1,6 +1,6 @@
 [package]
 name = "cloudraid"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 description = "Archivio cifrato con ridondanza Reed-Solomon distribuito su più storage"
 publish = false

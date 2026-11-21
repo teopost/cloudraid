@@ -191,6 +191,8 @@ struct Snapshot {
     local_root: String,
     /// Byte di file che si possono ancora caricare (stima); `None` se non c'è un limite noto.
     capacity_left: Option<u64>,
+    /// Per gli avvisi sull'affidabilità.
+    reliability: crate::repo::Reliability,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -266,6 +268,7 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
         apps: AppsView { dropbox: has(Provider::Dropbox), onedrive: has(Provider::OneDrive), gdrive: has(Provider::Google) },
         local_root: local_root(),
         capacity_left: repo.capacity_left(),
+        reliability: repo.reliability(),
         taken: now(),
         data_shards: cfg.data_shards,
         parity_shards: cfg.parity_shards,
@@ -633,6 +636,46 @@ impl App {
                 });
                 let _ = req.respond(r);
             }
+            (Method::Post, "/api/backends/edit") => {
+                let (name, new_name, limit) = match read_json(&mut req) {
+                    Ok(v) => {
+                        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::trim).unwrap_or_default().to_string();
+                        (s("name"), s("new_name"), v.get("limit_gb").and_then(Value::as_f64))
+                    }
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                if !valid_name(&new_name) {
+                    let _ = req.respond(error(400, "nome non valido: usa lettere minuscole, cifre, - e _ (al massimo 40 caratteri)"));
+                    return;
+                }
+                if limit.is_some_and(|gb| !gb.is_finite() || gb <= 0.0) {
+                    let _ = req.respond(error(400, "lo spazio allocato deve essere un numero di GB maggiore di zero, oppure vuoto"));
+                    return;
+                }
+                let config = self.opts.config.clone();
+                let r = self.start_job("edit-backend", format!("Modifica di {name}"), move |repo, _| {
+                    repo.lock()?;
+                    let mut done = Vec::new();
+                    if new_name != name {
+                        setup::rename_backend(&config, repo, &name, &new_name)?;
+                        done.push(format!("ora si chiama {new_name}"));
+                    }
+                    let current = repo.config().backends.iter().find(|b| b.name == new_name).and_then(|b| b.limit_gb);
+                    if current != limit {
+                        setup::set_limit(&config, repo, &new_name, limit)?;
+                        done.push(match limit {
+                            Some(gb) => format!("spazio allocato {gb} GB"),
+                            None => "nessuno spazio allocato: conta lo spazio libero del servizio".into(),
+                        });
+                    }
+                    let msg = if done.is_empty() { "nessuna modifica".into() } else { done.join(", ") };
+                    Ok((format!("{name}: {msg}"), None))
+                });
+                let _ = req.respond(r);
+            }
             (Method::Post, "/api/backends/limit") => {
                 let (name, limit) = match read_json(&mut req) {
                     Ok(v) => (
@@ -980,12 +1023,19 @@ impl App {
             }
             _ => return error(400, "tipo di spazio sconosciuto"),
         };
+        let limit_gb = match s("limit_gb").replace(',', ".").as_str() {
+            "" => None,
+            t => match t.parse::<f64>() {
+                Ok(gb) if gb.is_finite() && gb > 0.0 => Some(gb),
+                _ => return error(400, "lo spazio da usare deve essere un numero di GB maggiore di zero, oppure vuoto"),
+            },
+        };
         let config = self.opts.config.clone();
         let link_id = s("link_id");
         let app = self.clone();
         let label = format!("Aggiunta di {name}");
         self.start_job("add-backend", label, move |repo, _| {
-            let nb = NewBackend { config: BackendConfig { name: name.clone(), kind, delay_ms: 0, limit_gb: None }, secrets };
+            let nb = NewBackend { config: BackendConfig { name: name.clone(), kind, delay_ms: 0, limit_gb }, secrets };
             setup::add_backend(&config, repo, nb)?;
             lock(&app.links).remove(&link_id);
             Ok((format!("{name} aggiunto e provato: ora riceve i frammenti nuovi. Con \"Ribilancia\" gli passi anche una parte di quelli esistenti"), None))

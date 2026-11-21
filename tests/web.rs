@@ -383,3 +383,40 @@ fn limite_di_spazio_dall_interfaccia() {
     assert!(status(&lab, &cookie)["snapshot"]["backends"][0]["limit"].is_null());
     assert!(!fs::read_to_string(lab.tmp.path().join("cloudraid.toml")).unwrap().contains("limit_gb"));
 }
+
+#[test]
+fn modifica_nome_e_spazio_allocato() {
+    let lab = Lab::new();
+    let cookie = login(&lab);
+    run_job(&lab, &cookie, "PUT", "api/upload?path=a.bin", Some(&random("a", 300_000)));
+    // affidabilità: qui le 6 cartelle stanno sullo stesso disco, e l'interfaccia lo deve dire
+    let r = &status(&lab, &cookie)["snapshot"]["reliability"];
+    assert_eq!((r["active"].as_u64(), r["wanted"].as_u64(), r["writable"].as_bool()), (Some(6), Some(6), Some(true)), "{r}");
+    assert!(r["crowded_chunks"].as_u64().unwrap() > 0, "{r}");
+    assert_eq!(r["writes_survive_disk_loss"], false, "{r}");
+    // nome e spazio allocato insieme
+    let j = run_job(&lab, &cookie, "POST", "api/backends/edit", Some(br#"{"name":"acc0","new_name":"primo","limit_gb":0.5}"#));
+    assert_eq!(j["state"], "ok", "{j}");
+    assert!(j["message"].as_str().unwrap().contains("ora si chiama primo"), "{j}");
+    let b = &status(&lab, &cookie)["snapshot"]["backends"][0];
+    assert_eq!((b["name"].as_str(), b["limit"].as_u64()), (Some("primo"), Some(500_000_000)), "{b}");
+    // solo lo spazio allocato; poi niente da cambiare
+    let j = run_job(&lab, &cookie, "POST", "api/backends/edit", Some(br#"{"name":"primo","new_name":"primo","limit_gb":null}"#));
+    assert!(j["message"].as_str().unwrap().contains("nessuno spazio allocato"), "{j}");
+    let j = run_job(&lab, &cookie, "POST", "api/backends/edit", Some(br#"{"name":"primo","new_name":"primo","limit_gb":null}"#));
+    assert!(j["message"].as_str().unwrap().contains("nessuna modifica"), "{j}");
+    let bad = |body: &[u8]| call(&lab, "POST", "api/backends/edit", Some(&cookie), Some(body), &[("Content-Type", "application/json")]).code;
+    assert_eq!(bad(br#"{"name":"primo","new_name":"Primo Disco","limit_gb":null}"#), 400);
+    assert_eq!(bad(br#"{"name":"primo","new_name":"primo","limit_gb":0}"#), 400);
+    // spazio allocato già all'aggiunta: un valore sbagliato viene rifiutato subito
+    let r = call(
+        &lab,
+        "POST",
+        "api/backends",
+        Some(&cookie),
+        Some(br#"{"name":"nuovo","type":"webdav","url":"https://x.invalid/dav","user":"u","password":"p","limit_gb":"tanti"}"#),
+        &[("Content-Type", "application/json")],
+    );
+    assert_eq!(r.code, 400);
+    assert!(String::from_utf8_lossy(&r.body).contains("spazio da usare"));
+}

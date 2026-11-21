@@ -930,6 +930,8 @@ fn al_massimo_due_frammenti_sullo_stesso_disco() {
     }
     let s = repo.status();
     assert_eq!(s[0].same_device, ["acc1", "acc2"]);
+    let rel = repo.reliability();
+    assert_eq!((rel.crowded_chunks, rel.writes_survive_disk_loss, rel.active), (0, true, 6), "{rel:?}");
     drop(repo);
     // perso un intero "disco" (tre cartelle), i file si leggono ancora
     for i in 0..3 {

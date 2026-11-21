@@ -67,33 +67,20 @@
     </form>
   </dialog>
 
-  <dialog id="rename-dialog" class="dialog" aria-labelledby="rename-title">
-    <form id="rename-form" autocomplete="off">
-      <h3 id="rename-title">Rinomina lo spazio</h3>
-      <p class="muted">Cambia solo il nome con cui cloudraid lo chiama: i dati restano dove sono e non viene spostato niente.
-        La cartella sul servizio non cambia nome.</p>
-      <label class="field-label" for="rename-input">Nome nuovo</label>
-      <input id="rename-input" name="new_name" type="text" required maxlength="40" pattern="[a-z0-9_\-]+" spellcheck="false">
-      <p class="field-help">Solo lettere minuscole, cifre, - e _.</p>
-      <p id="rename-error" class="form-error" role="alert" hidden></p>
+  <dialog id="edit-dialog" class="dialog" aria-labelledby="edit-title">
+    <form id="edit-form" autocomplete="off">
+      <h3 id="edit-title">Modifica lo spazio</h3>
+      <label class="field-label" for="edit-name">Nome</label>
+      <input id="edit-name" name="new_name" type="text" required maxlength="40" pattern="[a-z0-9_\-]+" spellcheck="false">
+      <p class="field-help">Solo lettere minuscole, cifre, - e _. Cambia solo il nome con cui cloudraid lo chiama: i dati restano
+        dove sono e la cartella sul servizio non cambia nome.</p>
+      <label class="field-label" for="edit-gb">Spazio allocato (GB)</label>
+      <input id="edit-gb" name="limit_gb" type="text" inputmode="decimal" spellcheck="false" placeholder="tutto lo spazio libero">
+      <p class="field-help" id="edit-gb-help">Quanti GB al massimo può usare cloudraid su questo spazio. Lascia vuoto per usare tutto lo
+        spazio libero che il servizio dichiara.</p>
+      <p id="edit-error" class="form-error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <button type="button" class="btn btn-ghost" data-action="rename-close">Annulla</button>
-        <button type="submit" class="btn btn-primary">Rinomina</button>
-      </div>
-    </form>
-  </dialog>
-
-  <dialog id="limit-dialog" class="dialog" aria-labelledby="limit-title">
-    <form id="limit-form" autocomplete="off">
-      <h3 id="limit-title">Limite di spazio</h3>
-      <p class="muted">Quanto spazio al massimo può usare cloudraid su questo servizio. Utile dove il servizio non dice quanto
-        spazio resta (S3) o per restare dentro una quota gratuita. Lascia vuoto per usare tutto lo spazio libero.</p>
-      <label class="field-label" for="limit-input">Limite in GB</label>
-      <input id="limit-input" name="limit_gb" type="text" inputmode="decimal" spellcheck="false" placeholder="nessun limite">
-      <p class="field-help">Per esempio 9 per un servizio gratuito da 10 GB.</p>
-      <p id="limit-error" class="form-error" role="alert" hidden></p>
-      <div class="dialog-actions">
-        <button type="button" class="btn btn-ghost" data-action="limit-close">Annulla</button>
+        <button type="button" class="btn btn-ghost" data-action="edit-close">Annulla</button>
         <button type="submit" class="btn btn-primary">Salva</button>
       </div>
     </form>

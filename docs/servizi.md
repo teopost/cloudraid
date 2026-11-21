@@ -8,7 +8,7 @@ La prova cancella il file e la cartella che ha creato: sul servizio resta solo l
 fino alla 0.9 lasciavano una cartella vuota `prova`: la toglie **Pulisci** (pulizia dei frammenti orfani, nella
 pagina Manutenzione), oppure si può cancellare a mano.
 
-Il nome di uno spazio si può cambiare in ogni momento con **Rinomina**: cambia solo il nome con cui cloudraid lo chiama,
+Nome e spazio allocato di uno spazio si cambiano in ogni momento con **Modifica**. Il nome cambia solo per cloudraid:
 i dati restano dove sono e la cartella sul servizio non cambia nome.
 
 Password, chiavi segrete e token non finiscono mai in `cloudraid.toml`. Vanno in `config/credenziali.bin`, cifrati con
@@ -23,10 +23,11 @@ Piani gratuiti verificati il **21/11/2026**. Cambiano spesso, quindi controllali
   se gli spazi con posto sono meno di 6 i file nuovi usano 3 + 2 frammenti (poi 2 + 2...): occupano un po' di più, ma
   si possono sempre perdere 2 spazi qualsiasi. Con più di 6 spazi la capacità cresce meglio. La pagina Spazi mostra
   quanto si può ancora caricare.
-- **Limite per spazio.** Con **Limite**, in Spazi, si decide quanti GB al massimo cloudraid può usare su un servizio.
+- **Spazio allocato.** Per ogni spazio si può indicare quanti GB al massimo cloudraid può usare: già nella procedura di
+  aggiunta, oppure dopo con **Modifica**, in Spazi.
   Serve per S3 (che non dice quanto spazio resta) e per restare dentro una quota gratuita.
 - **Servizi che chiedono la carta di credito** (Cloudflare R2, Oracle, IDrive e2, Google Cloud Storage). Oltre la quota
-  gratuita fanno pagare, e non dicono quanto spazio resta: imposta **sempre un limite**, per esempio 9 GB per una quota
+  gratuita fanno pagare, e non dicono quanto spazio resta: indica **sempre lo spazio allocato**, per esempio 9 GB per una quota
   gratuita da 10 GB.
 - **Un solo account per servizio.** Più account sullo stesso provider spesso violano le condizioni d'uso. Soprattutto,
   non danno ridondanza vera: se quel provider ha un guasto, li perdi tutti insieme.

@@ -19,14 +19,30 @@ const state = {
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/** Dimensioni in unità decimali (kB, MB, GB), le stesse dello spazio allocato e dei servizi. */
 function bytes(n) {
+  return size(n);
+}
+
+/** Dimensioni degli spazi in unità decimali (GB = miliardi di byte), come le indicano i servizi. */
+function size(n) {
   if (n == null) return '-';
-  const u = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const u = ['B', 'kB', 'MB', 'GB', 'TB', 'PB'];
   let i = 0;
   let v = n;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return i === 0 ? `${n} B` : `${v.toLocaleString('it-IT', { maximumFractionDigits: v < 10 ? 1 : 0 })} ${u[i]}`;
+  while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+  return i === 0 ? `${n} B` : `${v.toLocaleString('it-IT', { maximumFractionDigits: v < 10 ? 2 : (v < 100 ? 1 : 0) })} ${u[i]}`;
 }
+
+/** Spazio di un backend per cloudraid: usato, capienza (usato + ancora utilizzabile), allocato o no. */
+function spaceOf(b) {
+  const used = b.bytes || 0;
+  if (b.free == null) return { used, cap: null, pct: null, allocated: false };
+  const cap = used + b.free;
+  return { used, cap, pct: cap > 0 ? Math.min(100, (100 * used) / cap) : 0, allocated: !!b.limit };
+}
+
+const pct = (p) => `${p.toLocaleString('it-IT', { maximumFractionDigits: p < 1 ? 2 : 1 })}%`;
 
 const num = (n) => Number(n || 0).toLocaleString('it-IT');
 const dateFmt = new Intl.DateTimeFormat('it-IT', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -251,12 +267,75 @@ function health(snap, history) {
   return ['ok', 'Ridondanza piena', `Tutti i ${snap.backends.length} backend sono disponibili e si possono perdere fino a ${m} backend senza perdere dati. ${tail}`];
 }
 
+/** Avvisi sull'affidabilità della configurazione, dal server. */
+function reliabilityNotes(snap) {
+  const r = snap.reliability;
+  if (!r) return [];
+  const k = snap.data_shards;
+  const m = snap.parity_shards;
+  const notes = [];
+  if (!r.writable) {
+    notes.push(['bad', 'Non si possono salvare file nuovi', `Servono almeno ${m + 1} spazi attivi, ce ne sono ${r.active}. Aggiungi uno spazio o rimetti in servizio uno dismesso.`]);
+  }
+  if (r.crowded_chunks > 0) {
+    notes.push(['warn', 'Troppi pezzi sullo stesso disco',
+      `${num(r.crowded_chunks)} blocchi hanno più di ${m} pezzi sullo stesso disco (${r.crowded_backends.join(', ')}): se quel disco si guasta, i file che li contengono sono persi. Aggiungi uno spazio su un altro disco o servizio e premi Ribilancia, che li sposta.`]);
+  }
+  if (r.writable && !r.writes_survive_disk_loss) {
+    notes.push(['warn', 'I file nuovi non reggono il guasto di un disco',
+      `Gli spazi attivi stanno su troppo pochi dischi o servizi diversi per mettere al massimo ${m} pezzi di ogni blocco sullo stesso disco. Aggiungi spazi su servizi cloud o su altri dischi.`]);
+  }
+  if (r.writable && r.active < r.wanted) {
+    notes.push(['warn', `Solo ${r.active} spazi attivi su ${r.wanted}`,
+      `I file nuovi usano meno pezzi di dati (${Math.max(1, r.active - m)} + ${m}): si possono sempre perdere ${m} spazi, ma occupano più spazio. Con ${r.wanted} o più spazi lo schema torna ${k} + ${m}.`]);
+  }
+  if (r.unknown_space.length) {
+    notes.push(['warn', 'Spazio non noto',
+      `${r.unknown_space.join(', ')} non dichiar${r.unknown_space.length === 1 ? 'a' : 'ano'} quanto spazio ha${r.unknown_space.length === 1 ? '' : 'nno'}: indica lo spazio allocato in Spazi, Modifica. Senza, la capienza totale non si può calcolare e cloudraid lo considera senza limite.`]);
+  }
+  if (snap.capacity_left != null) {
+    const total = snap.stored_size + snap.capacity_left;
+    if (total > 0 && snap.capacity_left < total * 0.1) {
+      notes.push(['warn', 'Spazio quasi esaurito', `Restano circa ${size(snap.capacity_left)} per i file nuovi. Aggiungi uno spazio o aumenta lo spazio allocato di uno esistente.`]);
+    }
+  }
+  return notes;
+}
+
+/** Lo spazio del repository come un unico disco. */
+function renderCapacity(snap) {
+  const used = snap.stored_size;
+  const left = snap.capacity_left;
+  const onServices = snap.backends.reduce((a, b) => a + b.bytes, 0);
+  if (left == null) {
+    return `<div class="card capacity-card">
+      <div class="capacity-head"><h3>Spazio</h3><span class="muted">${size(used)} di file salvati</span></div>
+      <div class="bar lg"><div data-w="0"></div></div>
+      <p class="muted small">La capienza totale non è nota: ${esc((snap.reliability && snap.reliability.unknown_space.join(', ')) || 'uno spazio')} non dice quanto spazio ha. Indica lo spazio allocato in Spazi, Modifica.</p>
+    </div>`;
+  }
+  const total = used + left;
+  const p = total > 0 ? (100 * used) / total : 0;
+  return `<div class="card capacity-card">
+    <div class="capacity-head">
+      <h3>Spazio</h3>
+      <span class="capacity-big"><strong>${size(used)}</strong> usati di <strong>${size(total)}</strong></span>
+    </div>
+    <div class="bar lg"><div class="${p > 90 ? 'bad' : p > 75 ? 'warn' : ''}" data-w="${p.toFixed(2)}"></div></div>
+    <div class="capacity-legend">
+      <span>${pct(p)} occupato</span>
+      <span>${size(left)} liberi per i file nuovi</span>
+    </div>
+    <p class="muted small">Come un unico disco: spazio per i file, già al netto della ridondanza (sui servizi i pezzi occupano ${size(onServices)}). La capienza dipende dallo spazio allocato o libero su ogni servizio.</p>
+  </div>`;
+}
+
 function renderOverview(st) {
   const snap = st.snapshot;
   if (!snap) return '<div class="card empty">Stato non ancora disponibile.</div>';
   const [kind, title, text] = health(snap, st.history);
   const used = snap.backends.reduce((a, b) => a + b.bytes, 0);
-  const maxBytes = Math.max(1, ...snap.backends.map((b) => b.bytes));
+  const notes = reliabilityNotes(snap);
   const scrub = lastScrub(st.history);
   const k = snap.data_shards;
   const m = snap.parity_shards;
@@ -286,8 +365,17 @@ function renderOverview(st) {
         <span class="pill ${backendState(b)[0]}">${backendState(b)[1]}</span>
       </div>
       <div class="backend-loc" title="${esc(b.location)}">${esc(b.location)}</div>
-      <div class="bar"><div data-w="${(b.bytes / maxBytes) * 100}"></div></div>
-      <div class="backend-nums"><span>${num(b.shards)} frammenti</span><span>${bytes(b.bytes)}</span></div>
+      ${(() => {
+        const s = spaceOf(b);
+        if (s.cap == null) {
+          return `<div class="bar unknown"><div data-w="0"></div></div>
+            <div class="backend-nums"><span>${size(b.bytes)} usati</span><span class="warn-text">spazio non noto</span></div>
+            <div class="muted small">${num(b.shards)} frammenti · indica lo spazio allocato in Spazi</div>`;
+        }
+        return `<div class="bar"><div class="${s.pct > 90 ? 'bad' : s.pct > 75 ? 'warn' : ''}" data-w="${s.pct.toFixed(2)}"></div></div>
+          <div class="backend-nums"><span>${size(s.used)} di ${size(s.cap)}</span><span>${pct(s.pct)}</span></div>
+          <div class="muted small">${num(b.shards)} frammenti · ${s.allocated ? `spazio allocato ${size(b.limit)}` : 'tutto lo spazio libero del servizio'}</div>`;
+      })()}
       ${b.latency_ms != null ? `<div class="muted small">lettura di un frammento: ${b.latency_ms < 1000 ? `${Math.round(b.latency_ms)} ms` : `${(b.latency_ms / 1000).toFixed(1)} s`}</div>` : ''}
       ${backendActions(b)}
     </div>`).join('');
@@ -301,6 +389,8 @@ function renderOverview(st) {
 
   return `
     <div class="banner ${kind}">${ICON[kind]}<div><strong>${esc(title)}</strong><p>${esc(text)}</p></div></div>
+    ${notes.map(([nk, nt, nx]) => `<div class="banner ${nk}">${ICON[nk]}<div><strong>${esc(nt)}</strong><p>${esc(nx)}</p></div></div>`).join('')}
+    ${renderCapacity(snap)}
     <div class="stats">
       <div class="card stat"><div class="label">File</div><div class="value">${num(snap.files.length)}</div><div class="sub">${num(snap.chunks)} blocchi</div></div>
       <div class="card stat"><div class="label">Dati</div><div class="value">${bytes(snap.total_size)}</div><div class="sub">${bytes(snap.stored_size)} dopo la deduplicazione</div></div>
@@ -679,10 +769,7 @@ function renderSpaces(st) {
     else if (!b.available) state = ['bad', 'non raggiungibile'];
     else if (b.shards === 0) state = ['run', 'nuovo, ancora vuoto'];
     else state = ['ok', 'in uso'];
-    const actions = [
-      `<button class="btn btn-ghost btn-sm" data-action="rename-space" data-name="${esc(b.name)}" ${dis}>Rinomina</button>`,
-      `<button class="btn btn-ghost btn-sm" data-action="limit-space" data-name="${esc(b.name)}" data-limit="${b.limit ? b.limit / 1e9 : ''}" ${dis}>Limite</button>`,
-    ];
+    const actions = [`<button class="btn btn-ghost btn-sm" data-action="edit-space" data-name="${esc(b.name)}" ${dis}>Modifica</button>`];
     if (!b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="retire" data-name="${esc(b.name)}" ${dis}>Dismetti</button>`);
     if (b.retired && b.shards > 0) actions.push(`<button class="btn btn-sm" data-action="retire-resume" data-name="${esc(b.name)}" ${dis}>Riprendi lo svuotamento</button>`);
     if (b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="unretire" data-name="${esc(b.name)}" ${dis}>Rimetti in servizio</button>`);
@@ -712,7 +799,7 @@ function renderSpaces(st) {
       <p class="muted">I pezzi vanno sugli spazi con più posto libero, così quelli grandi lavorano di più. Quando gli spazi con
         posto sono meno di ${k + m}, i file nuovi usano meno pezzi di dati (per esempio ${k - 1} + ${m}): occupano un po' di più,
         ma puoi sempre perdere ${m} spazi qualsiasi. Con più di ${k + m} spazi la capacità cresce meglio.</p>
-      <p class="capacity"><strong>${snap.capacity_left == null ? 'Spazio per nuovi file: nessun limite noto' : `Puoi ancora caricare circa ${bytes(snap.capacity_left)} di file`}</strong>
+      <p class="capacity"><strong>${snap.capacity_left == null ? 'Spazio per nuovi file: non noto (indica lo spazio allocato degli spazi che non lo dichiarano)' : `Puoi ancora caricare circa ${size(snap.capacity_left)} di file`}</strong>
         <span class="muted small">(stima, già tenendo conto della ridondanza)</span></p>
       <div class="card-actions">
         <button class="btn btn-primary" data-action="add-space" ${dis}>${ICON.plus} Aggiungi uno spazio</button>
@@ -730,13 +817,13 @@ function renderSpaces(st) {
 /** Riga dello spazio di uno spazio: usato da cloudraid, libero, limite, stesso disco. */
 function spaceLine(b) {
   const parts = [];
-  if (b.free != null) parts.push(`${bytes(b.free)} ancora utilizzabili`);
-  else parts.push('spazio libero non noto');
-  if (b.provider_total) parts.push(`servizio: ${bytes(b.provider_free || 0)} liberi su ${bytes(b.provider_total)}`);
-  if (b.limit) parts.push(`limite ${bytes(b.limit)}`);
-  const cap = (b.bytes || 0) + (b.free || 0);
-  const bar = b.free != null && cap > 0
-    ? `<div class="bar"><div class="bar-fill" data-w="${(100 * (b.bytes || 0) / cap).toFixed(1)}"></div></div>` : '';
+  const s = spaceOf(b);
+  if (s.cap != null) parts.push(`${size(s.used)} usati di ${size(s.cap)} (${pct(s.pct)})`);
+  else parts.push('spazio non noto: indica lo spazio allocato con Modifica');
+  parts.push(b.limit ? `spazio allocato ${size(b.limit)}` : 'nessuno spazio allocato');
+  if (b.provider_total) parts.push(`servizio: ${size(b.provider_free || 0)} liberi su ${size(b.provider_total)}`);
+  const bar = s.cap != null
+    ? `<div class="bar"><div class="${s.pct > 90 ? 'bad' : s.pct > 75 ? 'warn' : ''}" data-w="${s.pct.toFixed(2)}"></div></div>` : '';
   const warn = b.same_device && b.same_device.length
     ? `<p class="space-warn">${ICON.warn} Sullo stesso disco di ${b.same_device.map(esc).join(', ')}: se il disco si guasta si perdono insieme.</p>` : '';
   return `<div class="space-usage">${bar}<span class="muted small">${parts.join(' · ')}</span>${warn}</div>`;
@@ -826,6 +913,10 @@ function renderWizard() {
   let fields = field('name', 'Nome dello spazio', {
     value: suggestName(wiz.type),
     help: 'Solo lettere minuscole, cifre, - e _. Serve a riconoscerlo nell\'elenco.',
+  });
+  fields += field('limit_gb', 'Spazio allocato in GB (facoltativo)', {
+    placeholder: 'tutto lo spazio libero',
+    help: 'Quanti GB al massimo può usare cloudraid qui: per esempio 9 per un servizio gratuito da 10 GB. Per S3 conviene sempre indicarlo, perché il servizio non dice quanto spazio ha. Si può cambiare dopo con Modifica.',
   });
   if (wiz.type === 'local') {
     const root = (snap && snap.local_root) || '/mnt/cloudraid/dischi';
@@ -1081,48 +1172,29 @@ document.addEventListener('submit', (ev) => {
 
 $('#wizard').addEventListener('close', stopLinkPoll);
 
-$('#limit-form').addEventListener('submit', async (ev) => {
+$('#edit-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  const dlg = $('#limit-dialog');
+  const dlg = $('#edit-dialog');
   const name = dlg.dataset.name;
-  const raw = $('#limit-input').value.trim().replace(',', '.');
+  const newName = $('#edit-name').value.trim();
+  const raw = $('#edit-gb').value.trim().replace(',', '.');
   let limit = null;
   if (raw) {
     limit = Number(raw);
     if (!Number.isFinite(limit) || limit <= 0) {
-      $('#limit-error').textContent = 'Scrivi un numero di GB maggiore di zero, oppure lascia vuoto.';
-      $('#limit-error').hidden = false;
+      $('#edit-error').textContent = 'Lo spazio allocato deve essere un numero di GB maggiore di zero, oppure vuoto.';
+      $('#edit-error').hidden = false;
       return;
     }
   }
   try {
-    await api('api/backends/limit', { method: 'POST', body: { name, limit_gb: limit } });
+    await api('api/backends/edit', { method: 'POST', body: { name, new_name: newName, limit_gb: limit } });
     dlg.close();
-    toast(`Limite di ${name} in salvataggio`);
+    toast(`Modifica di ${name} in corso`);
     await refresh();
   } catch (e) {
-    $('#limit-error').textContent = e.message;
-    $('#limit-error').hidden = false;
-  }
-});
-
-$('#rename-form').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const dlg = $('#rename-dialog');
-  const name = dlg.dataset.name;
-  const newName = $('#rename-input').value.trim();
-  if (newName === name) {
-    dlg.close();
-    return;
-  }
-  try {
-    await api('api/backends/rename', { method: 'POST', body: { name, new_name: newName } });
-    dlg.close();
-    toast(`Rinomina di ${name} avviata`);
-    await refresh();
-  } catch (e) {
-    $('#rename-error').textContent = e.message;
-    $('#rename-error').hidden = false;
+    $('#edit-error').textContent = e.message;
+    $('#edit-error').hidden = false;
   }
 });
 
@@ -1241,30 +1313,24 @@ document.addEventListener('click', async (ev) => {
     case 'wiz-rebalance':
       closeWizard();
       return startJob('api/rebalance', { dry_run: false }, 'Ribilanciamento avviato');
-    case 'rename-space': {
-      const dlg = $('#rename-dialog');
-      dlg.dataset.name = el.dataset.name;
-      $('#rename-title').textContent = `Rinomina ${el.dataset.name}`;
-      $('#rename-input').value = el.dataset.name;
-      $('#rename-error').hidden = true;
+    case 'edit-space': {
+      const b = state.status.snapshot.backends.find((x) => x.name === el.dataset.name);
+      const dlg = $('#edit-dialog');
+      dlg.dataset.name = b.name;
+      $('#edit-title').textContent = `Modifica ${b.name}`;
+      $('#edit-name').value = b.name;
+      $('#edit-gb').value = b.limit ? String(+(b.limit / 1e9).toFixed(3)) : '';
+      const svc = b.provider_total
+        ? `Il servizio dichiara ${bytes(b.provider_free || 0)} liberi su ${bytes(b.provider_total)}.`
+        : (b.kind === 'local' ? '' : 'Il servizio non dice quanto spazio ha: conviene indicarlo qui.');
+      $('#edit-gb-help').textContent = `Quanti GB al massimo può usare cloudraid su questo spazio (ora ne usa ${bytes(b.bytes)}). Lascia vuoto per usare tutto lo spazio libero. ${svc}`;
+      $('#edit-error').hidden = true;
       dlg.showModal();
-      $('#rename-input').select();
+      $('#edit-name').focus();
       return undefined;
     }
-    case 'rename-close':
-      return $('#rename-dialog').close();
-    case 'limit-space': {
-      const dlg = $('#limit-dialog');
-      dlg.dataset.name = el.dataset.name;
-      $('#limit-title').textContent = `Limite di spazio per ${el.dataset.name}`;
-      $('#limit-input').value = el.dataset.limit || '';
-      $('#limit-error').hidden = true;
-      dlg.showModal();
-      $('#limit-input').select();
-      return undefined;
-    }
-    case 'limit-close':
-      return $('#limit-dialog').close();
+    case 'edit-close':
+      return $('#edit-dialog').close();
     case 'remove-space': {
       const name = el.dataset.name;
       if (await confirmDialog(`Togliere ${name}?`, `${name} è vuoto: viene tolto dalla configurazione e le sue credenziali vengono cancellate. I file sul servizio (se ne restano) non vengono toccati.`, 'Togli')) {

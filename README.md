@@ -277,7 +277,8 @@ niente:
 
   Su ogni servizio lascia libero un margine di 64 MiB. S3 non dichiara lo spazio. Lo si richiede ogni 5 minuti e, nel
   frattempo, si contano le scritture fatte.
-- **Limite facoltativo per backend:** `limit_gb = 9` in `cloudraid.toml`, oppure "Limite" in Spazi. È il massimo che
+- **Spazio allocato facoltativo per backend:** `limit_gb = 9` in `cloudraid.toml`, oppure il campo nella procedura di
+  aggiunta, oppure "Modifica" in Spazi (che cambia anche il nome). È il massimo che
   cloudraid usa su quel servizio. Serve per S3 e per restare dentro una quota gratuita.
 - **Cartelle sullo stesso disco:** si dividono la capienza del disco in parti uguali. Un blocco mette **al massimo m
   frammenti sullo stesso disco**, se si può: così un disco guasto non costa più della parità. Con 3 cartelle su un disco
@@ -294,6 +295,15 @@ niente:
 - **Più di k + m spazi:** la capacità cresce meglio. Ogni blocco usa i 6 con più posto, e i servizi grandi ricevono
   più frammenti.
 - **Quanto si può ancora caricare:** `status` e l'interfaccia mostrano una stima, calcolata simulando la distribuzione.
+  La Panoramica mostra lo spazio come un unico disco (file salvati, capienza totale al netto della ridondanza, barra di
+  occupazione) e, per ogni spazio, l'occupazione rispetto allo spazio allocato o libero.
+- **Avvisi sull'affidabilità** (Panoramica):
+  - meno di m + 1 spazi attivi;
+  - meno di k + m spazi attivi;
+  - blocchi con più di m frammenti sullo stesso disco;
+  - scritture nuove che non reggerebbero il guasto di un disco;
+  - spazi di capienza non nota;
+  - spazio quasi esaurito.
 - **Ribilanciamento:** sposta il frammento di ogni blocco dal backend con meno spazio libero a quello con più spazio
   libero, se la differenza vale il traffico. Un backend oltre il suo limite cede frammenti per primo. Anche dismissione
   e riparazione scelgono il backend con più spazio libero.
@@ -363,7 +373,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 - I blocchi scritti con meno frammenti di dati (3 + 2...) restano così: il ribilanciamento sposta frammenti, non
   ricodifica i blocchi.
 - Su OneDrive, con il solo permesso sulla cartella dell'app, alcuni account potrebbero non mostrare la quota: allora lo
-  spazio risulta "non noto" ed è meglio impostare un limite.
+  spazio risulta "non noto" ed è meglio indicare lo spazio allocato.
 - `init` solo su cartelle locali (vedi Installazione).
 - Anche l'elenco delle versioni dell'indice, all'apertura, aspetta tutti i backend: serve a non perdere l'indice
   più recente se è rimasto solo su un backend.
