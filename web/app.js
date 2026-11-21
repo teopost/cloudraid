@@ -263,8 +263,19 @@ function health(snap, history) {
   if (scrub && scrub.report.degraded_chunks > 0 && !(scrub.report.repair && scrub.report.unrepaired_shards === 0)) {
     return ['warn', 'Frammenti da riparare', `L'ultima verifica ha trovato ${scrub.report.degraded_chunks} blocchi con frammenti mancanti o danneggiati: lancia Verifica e ripara.`];
   }
+  // spazi sullo stesso disco fisico: un guasto del disco ne toglie più di uno insieme
+  const r = snap.reliability;
+  if (r && r.crowded_chunks > 0) {
+    return ['warn', 'Protezione incompleta: troppi pezzi sullo stesso disco',
+      `Tutti i backend sono disponibili e si possono perdere ${m} spazi qualsiasi, ma ${r.crowded_backends.join(', ')} stanno sullo stesso disco fisico: per ${num(r.crowded_chunks)} blocchi lì ci sono più di ${m} pezzi, quindi se quel disco si guasta i file che li contengono sono persi. Rimedio: aggiungi uno spazio su un altro disco o servizio e premi Ribilancia, che sposta i pezzi di troppo.`];
+  }
+  if (r && r.writable && !r.writes_survive_disk_loss) {
+    return ['warn', 'Protezione incompleta: i file nuovi non reggono il guasto di un disco',
+      `Si possono perdere ${m} spazi qualsiasi, ma gli spazi attivi stanno su troppo pochi dischi o servizi diversi: un disco guasto toglierebbe più di ${m} pezzi dei file nuovi. Aggiungi spazi su servizi cloud o su altri dischi.`];
+  }
   const tail = scrub ? `Ultima verifica ${ago(scrub.finished)}: tutto integro.` : 'Nessuna verifica ancora eseguita: conviene lanciarne una dalla Manutenzione.';
-  return ['ok', 'Ridondanza piena', `Tutti i ${snap.backends.length} backend sono disponibili e si possono perdere fino a ${m} backend senza perdere dati. ${tail}`];
+  const disks = snap.backends.some((b) => b.same_device && b.same_device.length) ? ', anche un disco intero con più spazi,' : '';
+  return ['ok', 'Ridondanza piena', `Tutti i ${snap.backends.length} backend sono disponibili e si possono perdere fino a ${m} spazi qualsiasi${disks} senza perdere dati. ${tail}`];
 }
 
 /** Avvisi sull'affidabilità della configurazione, dal server. */
@@ -277,14 +288,7 @@ function reliabilityNotes(snap) {
   if (!r.writable) {
     notes.push(['bad', 'Non si possono salvare file nuovi', `Servono almeno ${m + 1} spazi attivi, ce ne sono ${r.active}. Aggiungi uno spazio o rimetti in servizio uno dismesso.`]);
   }
-  if (r.crowded_chunks > 0) {
-    notes.push(['warn', 'Troppi pezzi sullo stesso disco',
-      `${num(r.crowded_chunks)} blocchi hanno più di ${m} pezzi sullo stesso disco (${r.crowded_backends.join(', ')}): se quel disco si guasta, i file che li contengono sono persi. Aggiungi uno spazio su un altro disco o servizio e premi Ribilancia, che li sposta.`]);
-  }
-  if (r.writable && !r.writes_survive_disk_loss) {
-    notes.push(['warn', 'I file nuovi non reggono il guasto di un disco',
-      `Gli spazi attivi stanno su troppo pochi dischi o servizi diversi per mettere al massimo ${m} pezzi di ogni blocco sullo stesso disco. Aggiungi spazi su servizi cloud o su altri dischi.`]);
-  }
+  // blocchi con troppi pezzi su un disco e file nuovi non protetti: sono nel riquadro principale (health)
   if (r.writable && r.active < r.wanted) {
     notes.push(['warn', `Solo ${r.active} spazi attivi su ${r.wanted}`,
       `I file nuovi usano meno pezzi di dati (${Math.max(1, r.active - m)} + ${m}): si possono sempre perdere ${m} spazi, ma occupano più spazio. Con ${r.wanted} o più spazi lo schema torna ${k} + ${m}.`]);
