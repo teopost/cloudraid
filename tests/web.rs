@@ -31,6 +31,7 @@ fn config(tmp: &TempDir) -> Config {
                 name: format!("acc{i}"),
                 kind: BackendKind::Local { path: tmp.path().join(format!("acc{i}")) },
                 delay_ms: 0,
+                limit_gb: None,
             })
             .collect(),
     }
@@ -247,10 +248,20 @@ fn carica_scarica_verifica_ripara_elimina() {
     let r = call(&lab, "GET", "api/download?path=cartella%20uno/dati.bin", Some(&cookie), None, &[]);
     assert!(r.body == data);
 
-    // le scritture con un backend mancante vengono rifiutate e l'errore arriva all'interfaccia
-    let j = run_job(&lab, &cookie, "PUT", "api/upload?path=altro.bin", Some(b"ciao"));
+    // con un backend mancante si scrive lo stesso (3 + 2 sui 5 rimasti)
+    let j = run_job(&lab, &cookie, "PUT", "api/upload?path=cartella%20uno/altro.bin", Some(b"ciao"));
+    assert_eq!(j["state"], "ok", "{j}");
+    // con meno di 3 backend no, e l'errore arriva all'interfaccia
+    for i in 3..6 {
+        fs::rename(lab.dir(i), lab.dir(i).with_extension("via")).unwrap();
+    }
+    run_job(&lab, &cookie, "POST", "api/refresh", None);
+    let j = run_job(&lab, &cookie, "PUT", "api/upload?path=altro.bin", Some(b"contenuto nuovo, non deduplicabile"));
     assert_eq!(j["state"], "error");
-    assert!(j["message"].as_str().unwrap().contains("servono 6 backend"), "{j}");
+    assert!(j["message"].as_str().unwrap().contains("servono almeno 3 backend"), "{j}");
+    for i in 3..6 {
+        fs::rename(lab.dir(i).with_extension("via"), lab.dir(i)).unwrap();
+    }
     fs::create_dir_all(lab.dir(2)).unwrap();
     run_job(&lab, &cookie, "POST", "api/refresh", None);
     run_job(&lab, &cookie, "POST", "api/scrub", Some(br#"{"repair":true}"#));
@@ -350,4 +361,25 @@ fn file_aggiunti_da_fuori_compaiono_da_soli() {
         assert!(start.elapsed() < std::time::Duration::from_secs(10), "il file aggiunto da fuori non compare");
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+#[test]
+fn limite_di_spazio_dall_interfaccia() {
+    let lab = Lab::new();
+    let cookie = login(&lab);
+    let st = status(&lab, &cookie);
+    assert!(st["snapshot"]["capacity_left"].as_u64().is_some(), "stima della capacità");
+    assert!(st["snapshot"]["backends"][0]["free"].as_u64().is_some(), "spazio libero della cartella");
+    let j = run_job(&lab, &cookie, "POST", "api/backends/limit", Some(br#"{"name":"acc0","limit_gb":0.002}"#));
+    assert_eq!(j["state"], "ok", "{j}");
+    let st = status(&lab, &cookie);
+    assert_eq!(st["snapshot"]["backends"][0]["limit"], 2_000_000);
+    assert!(st["snapshot"]["backends"][0]["free"].as_u64().unwrap() <= 2_000_000);
+    assert!(fs::read_to_string(lab.tmp.path().join("cloudraid.toml")).unwrap().contains("limit_gb = 0.002"));
+    let r = call(&lab, "POST", "api/backends/limit", Some(&cookie), Some(br#"{"name":"acc0","limit_gb":-1}"#), &[("Content-Type", "application/json")]);
+    assert_eq!(r.code, 400);
+    let j = run_job(&lab, &cookie, "POST", "api/backends/limit", Some(br#"{"name":"acc0","limit_gb":null}"#));
+    assert_eq!(j["state"], "ok", "{j}");
+    assert!(status(&lab, &cookie)["snapshot"]["backends"][0]["limit"].is_null());
+    assert!(!fs::read_to_string(lab.tmp.path().join("cloudraid.toml")).unwrap().contains("limit_gb"));
 }

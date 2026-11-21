@@ -679,7 +679,10 @@ function renderSpaces(st) {
     else if (!b.available) state = ['bad', 'non raggiungibile'];
     else if (b.shards === 0) state = ['run', 'nuovo, ancora vuoto'];
     else state = ['ok', 'in uso'];
-    const actions = [`<button class="btn btn-ghost btn-sm" data-action="rename-space" data-name="${esc(b.name)}" ${dis}>Rinomina</button>`];
+    const actions = [
+      `<button class="btn btn-ghost btn-sm" data-action="rename-space" data-name="${esc(b.name)}" ${dis}>Rinomina</button>`,
+      `<button class="btn btn-ghost btn-sm" data-action="limit-space" data-name="${esc(b.name)}" data-limit="${b.limit ? b.limit / 1e9 : ''}" ${dis}>Limite</button>`,
+    ];
     if (!b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="retire" data-name="${esc(b.name)}" ${dis}>Dismetti</button>`);
     if (b.retired && b.shards > 0) actions.push(`<button class="btn btn-sm" data-action="retire-resume" data-name="${esc(b.name)}" ${dis}>Riprendi lo svuotamento</button>`);
     if (b.retired) actions.push(`<button class="btn btn-ghost btn-sm" data-action="unretire" data-name="${esc(b.name)}" ${dis}>Rimetti in servizio</button>`);
@@ -696,6 +699,7 @@ function renderSpaces(st) {
           <span class="pill ${state[0]}">${state[1]}</span>
           <span class="muted small">${num(b.shards)} frammenti · ${bytes(b.bytes)}</span>
         </div>
+        ${spaceLine(b)}
         <div class="card-actions">${actions.join('')}</div>
       </div>`;
   }).join('');
@@ -704,8 +708,12 @@ function renderSpaces(st) {
       <h3>Dove sono i tuoi dati</h3>
       <p class="muted">Ogni file viene cifrato e diviso in <strong>${k + m} pezzi</strong>, ognuno su uno spazio diverso.
         Per ricostruirlo ne bastano <strong>${k}</strong>: puoi perdere <strong>${m} spazi qualsiasi</strong> (un account chiuso,
-        un disco rotto) senza perdere niente. Per questo servono almeno ${k + m} spazi attivi; con qualcuno in più c'è margine
-        per sostituirne uno senza fretta.</p>
+        un disco rotto) senza perdere niente.</p>
+      <p class="muted">I pezzi vanno sugli spazi con più posto libero, così quelli grandi lavorano di più. Quando gli spazi con
+        posto sono meno di ${k + m}, i file nuovi usano meno pezzi di dati (per esempio ${k - 1} + ${m}): occupano un po' di più,
+        ma puoi sempre perdere ${m} spazi qualsiasi. Con più di ${k + m} spazi la capacità cresce meglio.</p>
+      <p class="capacity"><strong>${snap.capacity_left == null ? 'Spazio per nuovi file: nessun limite noto' : `Puoi ancora caricare circa ${bytes(snap.capacity_left)} di file`}</strong>
+        <span class="muted small">(stima, già tenendo conto della ridondanza)</span></p>
       <div class="card-actions">
         <button class="btn btn-primary" data-action="add-space" ${dis}>${ICON.plus} Aggiungi uno spazio</button>
         <button class="btn btn-ghost" data-action="apps-settings" ${dis}>Collegamento con Google, Microsoft e Dropbox</button>
@@ -717,6 +725,21 @@ function renderSpaces(st) {
       <div class="card-actions"><button class="btn btn-sm" data-action="rebalance" ${dis}>Ribilancia ora</button></div></div></div>` : ''}
     <div class="spaces">${rows}</div>
     <p class="note">Per sostituire un account: aggiungi quello nuovo, poi "Dismetti" su quello vecchio. Quando è vuoto lo puoi togliere.</p>`;
+}
+
+/** Riga dello spazio di uno spazio: usato da cloudraid, libero, limite, stesso disco. */
+function spaceLine(b) {
+  const parts = [];
+  if (b.free != null) parts.push(`${bytes(b.free)} ancora utilizzabili`);
+  else parts.push('spazio libero non noto');
+  if (b.provider_total) parts.push(`servizio: ${bytes(b.provider_free || 0)} liberi su ${bytes(b.provider_total)}`);
+  if (b.limit) parts.push(`limite ${bytes(b.limit)}`);
+  const cap = (b.bytes || 0) + (b.free || 0);
+  const bar = b.free != null && cap > 0
+    ? `<div class="bar"><div class="bar-fill" data-w="${(100 * (b.bytes || 0) / cap).toFixed(1)}"></div></div>` : '';
+  const warn = b.same_device && b.same_device.length
+    ? `<p class="space-warn">${ICON.warn} Sullo stesso disco di ${b.same_device.map(esc).join(', ')}: se il disco si guasta si perdono insieme.</p>` : '';
+  return `<div class="space-usage">${bar}<span class="muted small">${parts.join(' · ')}</span>${warn}</div>`;
 }
 
 // ---- procedura guidata ----
@@ -1058,6 +1081,31 @@ document.addEventListener('submit', (ev) => {
 
 $('#wizard').addEventListener('close', stopLinkPoll);
 
+$('#limit-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const dlg = $('#limit-dialog');
+  const name = dlg.dataset.name;
+  const raw = $('#limit-input').value.trim().replace(',', '.');
+  let limit = null;
+  if (raw) {
+    limit = Number(raw);
+    if (!Number.isFinite(limit) || limit <= 0) {
+      $('#limit-error').textContent = 'Scrivi un numero di GB maggiore di zero, oppure lascia vuoto.';
+      $('#limit-error').hidden = false;
+      return;
+    }
+  }
+  try {
+    await api('api/backends/limit', { method: 'POST', body: { name, limit_gb: limit } });
+    dlg.close();
+    toast(`Limite di ${name} in salvataggio`);
+    await refresh();
+  } catch (e) {
+    $('#limit-error').textContent = e.message;
+    $('#limit-error').hidden = false;
+  }
+});
+
 $('#rename-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const dlg = $('#rename-dialog');
@@ -1205,6 +1253,18 @@ document.addEventListener('click', async (ev) => {
     }
     case 'rename-close':
       return $('#rename-dialog').close();
+    case 'limit-space': {
+      const dlg = $('#limit-dialog');
+      dlg.dataset.name = el.dataset.name;
+      $('#limit-title').textContent = `Limite di spazio per ${el.dataset.name}`;
+      $('#limit-input').value = el.dataset.limit || '';
+      $('#limit-error').hidden = true;
+      dlg.showModal();
+      $('#limit-input').select();
+      return undefined;
+    }
+    case 'limit-close':
+      return $('#limit-dialog').close();
     case 'remove-space': {
       const name = el.dataset.name;
       if (await confirmDialog(`Togliere ${name}?`, `${name} è vuoto: viene tolto dalla configurazione e le sue credenziali vengono cancellate. I file sul servizio (se ne restano) non vengono toccati.`, 'Togli')) {

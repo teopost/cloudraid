@@ -155,6 +155,12 @@ struct BackendRow {
     /// Tempo medio di lettura di un frammento, misurato da questo processo.
     latency_ms: Option<f64>,
     retired: bool,
+    /// Spazio ancora utilizzabile da cloudraid (`None`: non noto).
+    free: Option<u64>,
+    provider_free: Option<u64>,
+    provider_total: Option<u64>,
+    limit: Option<u64>,
+    same_device: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -183,6 +189,8 @@ struct Snapshot {
     apps: AppsView,
     /// Dove si possono creare cartelle locali.
     local_root: String,
+    /// Byte di file che si possono ancora caricare (stima); `None` se non c'è un limite noto.
+    capacity_left: Option<u64>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -257,6 +265,7 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
     Snapshot {
         apps: AppsView { dropbox: has(Provider::Dropbox), onedrive: has(Provider::OneDrive), gdrive: has(Provider::Google) },
         local_root: local_root(),
+        capacity_left: repo.capacity_left(),
         taken: now(),
         data_shards: cfg.data_shards,
         parity_shards: cfg.parity_shards,
@@ -282,6 +291,11 @@ fn take_snapshot(repo: &Repo) -> Snapshot {
                 bytes: b.bytes,
                 latency_ms: b.latency_ms,
                 retired: b.retired,
+                free: b.free,
+                provider_free: b.provider_free,
+                provider_total: b.provider_total,
+                limit: b.limit,
+                same_device: b.same_device,
             })
             .collect(),
         locks: repo
@@ -508,6 +522,7 @@ impl App {
             (Method::Post, "/api/refresh") => {
                 let r = self.start_job("refresh", "Aggiornamento dello stato".into(), move |repo, _| {
                     repo.reload()?;
+                    repo.refresh_space();
                     Ok(("Stato aggiornato".into(), None))
                 });
                 let _ = req.respond(r);
@@ -615,6 +630,39 @@ impl App {
                     repo.lock()?;
                     setup::rename_backend(&config, repo, &name, &new_name)?;
                     Ok((format!("{name} ora si chiama {new_name}"), None))
+                });
+                let _ = req.respond(r);
+            }
+            (Method::Post, "/api/backends/limit") => {
+                let (name, limit) = match read_json(&mut req) {
+                    Ok(v) => (
+                        v.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                        v.get("limit_gb").and_then(Value::as_f64),
+                    ),
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                if limit.is_some_and(|gb| !gb.is_finite() || gb <= 0.0) {
+                    let _ = req.respond(error(400, "il limite deve essere un numero di GB maggiore di zero"));
+                    return;
+                }
+                let config = self.opts.config.clone();
+                let label = match limit {
+                    Some(gb) => format!("Limite di {name}: {gb} GB"),
+                    None => format!("Limite di {name} tolto"),
+                };
+                let r = self.start_job("limit-backend", label, move |repo, _| {
+                    repo.lock()?;
+                    setup::set_limit(&config, repo, &name, limit)?;
+                    Ok((
+                        match limit {
+                            Some(gb) => format!("{name}: cloudraid userà al massimo {gb} GB"),
+                            None => format!("{name}: nessun limite, conta lo spazio libero del servizio"),
+                        },
+                        None,
+                    ))
                 });
                 let _ = req.respond(r);
             }
@@ -781,10 +829,11 @@ impl App {
         }
         let generation = repo.index().generation;
         match repo.reload() {
-            Ok(()) if repo.index().generation != generation => {
+            // anche a indice invariato: lo spazio libero può essere stato riletto
+            Ok(()) => {
+                let _ = generation;
                 *lock(&self.snapshot) = Some(take_snapshot(repo));
             }
-            Ok(()) => {}
             Err(e) => eprintln!("attenzione: controllo dell'indice: {e:#}"),
         }
     }
@@ -936,7 +985,7 @@ impl App {
         let app = self.clone();
         let label = format!("Aggiunta di {name}");
         self.start_job("add-backend", label, move |repo, _| {
-            let nb = NewBackend { config: BackendConfig { name: name.clone(), kind, delay_ms: 0 }, secrets };
+            let nb = NewBackend { config: BackendConfig { name: name.clone(), kind, delay_ms: 0, limit_gb: None }, secrets };
             setup::add_backend(&config, repo, nb)?;
             lock(&app.links).remove(&link_id);
             Ok((format!("{name} aggiunto e provato: ora riceve i frammenti nuovi. Con \"Ribilancia\" gli passi anche una parte di quelli esistenti"), None))

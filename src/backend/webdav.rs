@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use super::http::{self, Availability, Outcome, Step};
-use super::Backend;
+use super::{Backend, Space};
 use crate::credentials::Credentials;
 use crate::xml;
 
@@ -23,9 +23,22 @@ pub struct Webdav {
     avail: Availability,
     /// Cartelle già create o viste: niente MKCOL ripetuti.
     dirs: Mutex<HashSet<String>>,
+    /// Una creazione di cartella alla volta.
+    mkcol: Mutex<()>,
 }
 
 const PROPFIND: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/></d:prop></d:propfind>"#;
+
+const QUOTA: &[u8] = br#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:quota-available-bytes/><d:quota-used-bytes/></d:prop></d:propfind>"#;
+
+/// Spazio da una risposta PROPFIND con le proprietà di RFC 4331. Valori negativi (Nextcloud usa -3
+/// per "illimitato") o mancanti: spazio non noto.
+fn parse_quota(xml: &str) -> Option<Space> {
+    let free: u64 = xml::text(xml, "quota-available-bytes")?.trim().parse().ok()?;
+    let used: Option<u64> = xml::text(xml, "quota-used-bytes").and_then(|s| s.trim().parse().ok());
+    Some(Space { free, total: used.map(|u| u + free), device: None })
+}
+
 
 impl Webdav {
     pub fn new(name: String, url: &str, user: &str, creds: Arc<Credentials>) -> Webdav {
@@ -40,6 +53,7 @@ impl Webdav {
             creds,
             avail: Availability::default(),
             dirs: Mutex::new(HashSet::new()),
+            mkcol: Mutex::new(()),
         }
     }
 
@@ -64,13 +78,20 @@ impl Webdav {
         Ok(http::agent().request(method, url).set("Authorization", &self.auth()?))
     }
 
-    /// Crea la cartella `dir` e quelle che la contengono, se servono.
+    /// Crea la cartella `dir` e quelle che la contengono, se servono. Una creazione alla volta: più
+    /// scritture in parallelo chiederebbero la stessa cartella insieme, e alcuni server (Koofr)
+    /// rispondono 423 Locked a quella che arriva seconda.
     fn ensure_dir(&self, dir: &str) -> Result<()> {
         if dir.is_empty() || self.dirs.lock().unwrap().contains(dir) {
             return Ok(());
         }
+        // prima la cartella madre (fuori dal lucchetto: la chiamata ricorsiva lo riprende)
         if let Some((parent, _)) = dir.rsplit_once('/') {
             self.ensure_dir(parent)?;
+        }
+        let _one_at_a_time = self.mkcol.lock().unwrap();
+        if self.dirs.lock().unwrap().contains(dir) {
+            return Ok(());
         }
         let url = format!("{}/", self.url(dir));
         http::retry(&format!("backend {}: creazione di {dir}", self.name), || {
@@ -81,6 +102,10 @@ impl Webdav {
             match http::send(req, None) {
                 // 405: esiste già
                 Outcome::Response(r) if (200..300).contains(&r.status()) || r.status() == 405 => Step::Done(()),
+                // 423: un'altra richiesta la sta creando in questo momento (anche da un altro processo)
+                Outcome::Response(r) if r.status() == 423 => {
+                    Step::Retry(anyhow!("cartella {dir} occupata (423)"), Some(std::time::Duration::from_millis(500)))
+                }
                 Outcome::Response(r) => http::unexpected(r),
                 Outcome::Transport(e) => Step::Retry(e, None),
             }
@@ -235,6 +260,27 @@ impl Backend for Webdav {
         })
     }
 
+    fn space(&self) -> Result<Option<Space>> {
+        let url = self.url("");
+        let text = http::retry(&format!("backend {}: spazio libero", self.name), || {
+            let req = match self.request("PROPFIND", &url) {
+                Ok(r) => r.set("Depth", "0").set("Content-Type", "application/xml; charset=utf-8"),
+                Err(e) => return Step::Fail(e),
+            };
+            match http::send(req, Some(QUOTA)) {
+                Outcome::Response(r) if r.status() == 207 => match http::body(r) {
+                    Ok(b) => Step::Done(Some(String::from_utf8_lossy(&b).into_owned())),
+                    Err(e) => Step::Retry(e, None),
+                },
+                // server senza quote o che non accetta la richiesta: spazio non noto
+                Outcome::Response(r) if (400..500).contains(&r.status()) => Step::Done(None),
+                Outcome::Response(r) => http::unexpected(r),
+                Outcome::Transport(e) => Step::Retry(e, None),
+            }
+        })?;
+        Ok(text.as_deref().and_then(parse_quota))
+    }
+
     fn remove_dir(&self, dir: &str) -> Result<()> {
         super::check_key(dir)?;
         let url = format!("{}/", self.url(dir));
@@ -282,5 +328,16 @@ impl Backend for Webdav {
     fn refresh(&self) {
         self.avail.reset();
         self.dirs.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn quota_webdav() {
+        let x = r#"<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:quota-available-bytes>1000</d:quota-available-bytes><d:quota-used-bytes>24</d:quota-used-bytes></d:prop></d:propstat></d:response></d:multistatus>"#;
+        assert_eq!(super::parse_quota(x).map(|s| (s.free, s.total)), Some((1000, Some(1024))));
+        assert!(super::parse_quota(&x.replace("1000", "-3")).is_none());
+        assert!(super::parse_quota("<d:multistatus/>").is_none());
     }
 }

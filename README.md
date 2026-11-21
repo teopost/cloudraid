@@ -263,15 +263,50 @@ Misura sul repository dimostrativo (7 cartelle, 27 MB) con una cartella rallenta
 
 `delay_ms` nella sezione di un backend (solo per prove) rallenta apposta ogni sua lettura.
 
+### Spazi di capienza diversa
+
+Ogni blocco va sui backend con **più spazio libero**, così quelli grandi lavorano di più e uno piccolo pieno non ferma
+niente:
+
+- **Spazio libero:** cloudraid lo legge dal servizio:
+  - Dropbox `users/get_space_usage`;
+  - OneDrive `/me/drive` (quota);
+  - Google Drive `about.storageQuota`;
+  - WebDAV con le proprietà RFC 4331 (`quota-available-bytes`);
+  - per le cartelle locali, lo spazio libero del disco.
+
+  Su ogni servizio lascia libero un margine di 64 MiB. S3 non dichiara lo spazio. Lo si richiede ogni 5 minuti e, nel
+  frattempo, si contano le scritture fatte.
+- **Limite facoltativo per backend:** `limit_gb = 9` in `cloudraid.toml`, oppure "Limite" in Spazi. È il massimo che
+  cloudraid usa su quel servizio. Serve per S3 e per restare dentro una quota gratuita.
+- **Cartelle sullo stesso disco:** si dividono la capienza del disco in parti uguali. Un blocco mette **al massimo m
+  frammenti sullo stesso disco**, se si può: così un disco guasto non costa più della parità. Con 3 cartelle su un disco
+  e 3 servizi cloud i blocchi diventano 3 + 2, 2 frammenti sul disco e 3 sul cloud, e sopravvivono al guasto del disco.
+  Se non si può (per esempio, solo cartelle sullo stesso disco) si scrive senza questo vincolo. Il ribilanciamento
+  sposta per primi i frammenti di troppo su un disco, quando c'è un backend su cui metterli. L'interfaccia avvisa delle
+  cartelle sullo stesso disco.
+- **Meno di k + m backend con posto** (per esempio uno spazio piccolo pieno, o uno spento): il blocco usa meno frammenti
+  di dati, cioè 3 + 2, poi 2 + 2, poi 1 + 2 con lo schema 4 + 2. La parità resta la stessa, quindi si possono **sempre
+  perdere m backend qualsiasi**; costa solo un po' di spazio in più (1,67x, 2x, 3x invece di 1,5x).
+
+  L'indice registra k e m di ogni blocco, e lettura, verifica e riparazione li usano blocco per blocco: anche le
+  versioni precedenti leggono questi blocchi.
+- **Più di k + m spazi:** la capacità cresce meglio. Ogni blocco usa i 6 con più posto, e i servizi grandi ricevono
+  più frammenti.
+- **Quanto si può ancora caricare:** `status` e l'interfaccia mostrano una stima, calcolata simulando la distribuzione.
+- **Ribilanciamento:** sposta il frammento di ogni blocco dal backend con meno spazio libero a quello con più spazio
+  libero, se la differenza vale il traffico. Un backend oltre il suo limite cede frammenti per primo. Anche dismissione
+  e riparazione scelgono il backend con più spazio libero.
+
 ### Pulizia e ribilanciamento
 
 - `cloudraid gc` elenca tutti gli oggetti nelle cartelle `data/` dei backend (su Dropbox e S3 con elenchi
   ricorsivi, sugli altri cartella per cartella) e cancella quelli che l'indice non usa: frammenti di caricamenti interrotti, file temporanei, copie
   vecchie rimaste su un backend tornato disponibile dopo una riparazione. Prende il lock, così nessun altro
   processo sta caricando frammenti non ancora nell'indice. I backend non raggiungibili vengono saltati.
-- `cloudraid rebalance` sposta frammenti dai backend sopra la media a quelli più vuoti, per esempio dopo averne
-  aggiunto uno. I frammenti di un blocco restano sempre su backend diversi, e uno spostamento si fa solo se riduce
-  davvero lo squilibrio. Ogni frammento viene verificato prima di copiarlo; la copia vecchia si cancella solo dopo il
+- `cloudraid rebalance` sposta frammenti dai backend con meno spazio libero a quelli con più spazio libero (vedi sopra),
+  per esempio dopo averne aggiunto uno o dopo aver abbassato un limite. I frammenti di un blocco restano sempre su
+  backend diversi, e uno spostamento si fa solo se la differenza supera il 5% del carico medio. Ogni frammento viene verificato prima di copiarlo; la copia vecchia si cancella solo dopo il
   salvataggio dell'indice, che avviene ogni 64 spostamenti, così un'interruzione perde poco lavoro e lascia solo
   orfani innocui. Con i cloud costa traffico: prima guarda il piano con `--dry-run`.
 - Tutte e due sono anche nell'interfaccia web (Manutenzione), con simulazione, conferma e avanzamento.
@@ -322,14 +357,19 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
   istante se ne accorgono rileggendo i lock, ma è una protezione dagli errori, non una garanzia assoluta.
 - Le **scritture** vanno alla velocità del backend più lento: ogni blocco ha un frammento su ognuno di k + m backend.
-- Dropbox, OneDrive e Google Drive sono provati contro server finti fedeli alle API, non ancora contro gli account
-  veri: serve prima registrare le app (vedi sopra). WebDAV e S3 sono provati anche contro server veri
-  (hacdias/webdav e Versity S3 Gateway, che controlla le firme).
+- Dropbox, OneDrive e Koofr (WebDAV) sono provati anche con account veri; Google Drive solo contro un server finto
+  fedele alle API. WebDAV e S3 sono provati anche contro server veri (hacdias/webdav e Versity S3 Gateway, che
+  controlla le firme).
+- I blocchi scritti con meno frammenti di dati (3 + 2...) restano così: il ribilanciamento sposta frammenti, non
+  ricodifica i blocchi.
+- Su OneDrive, con il solo permesso sulla cartella dell'app, alcuni account potrebbero non mostrare la quota: allora lo
+  spazio risulta "non noto" ed è meglio impostare un limite.
 - `init` solo su cartelle locali (vedi Installazione).
 - Anche l'elenco delle versioni dell'indice, all'apertura, aspetta tutti i backend: serve a non perdere l'indice
   più recente se è rimasto solo su un backend.
-- Lo spazio libero dei backend non viene controllato prima di scrivere: un account pieno fa fallire la scrittura,
-  che passa su un backend di riserva se c'è.
+- Più processi che scrivono non si scambiano le prenotazioni di spazio: ognuno conta le sue scritture e rilegge lo
+  spazio dai servizi ogni 5 minuti. Un servizio che rifiuta per mancanza di spazio viene escluso fino al controllo
+  successivo, e il frammento va su un altro.
 
 ## Tappe
 

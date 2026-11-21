@@ -28,6 +28,18 @@ mod webdav;
 
 pub use gdrive::ensure_folder as gdrive_ensure_folder;
 
+/// Spazio sul servizio, come lo dichiara il servizio stesso (vale per tutto l'account, non solo per
+/// cloudraid).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Space {
+    /// Byte ancora liberi.
+    pub free: u64,
+    /// Capienza totale, se nota.
+    pub total: Option<u64>,
+    /// Dispositivo (solo cartelle locali): più backend sullo stesso disco ne condividono lo spazio.
+    pub device: Option<u64>,
+}
+
 pub trait Backend: Send + Sync {
     fn name(&self) -> &str;
     /// Dove sta, per i messaggi (percorso o remote).
@@ -50,6 +62,11 @@ pub trait Backend: Send + Sync {
     /// non serve). Usata solo per la cartella della prova, che non contiene altro.
     fn remove_dir(&self, _dir: &str) -> Result<()> {
         Ok(())
+    }
+    /// Spazio libero sul servizio. `Ok(None)` se il servizio non lo dice (S3): allora vale solo
+    /// l'eventuale limite della configurazione.
+    fn space(&self) -> Result<Option<Space>> {
+        Ok(None)
     }
     /// Tipo di backend, per l'interfaccia ("local", "webdav", "s3"...).
     fn kind(&self) -> &'static str;
@@ -169,6 +186,9 @@ impl Backend for Slow {
     fn remove_dir(&self, dir: &str) -> Result<()> {
         self.inner.remove_dir(dir)
     }
+    fn space(&self) -> Result<Option<Space>> {
+        self.inner.space()
+    }
     fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>> {
         self.inner.list_all(dir)
     }
@@ -220,6 +240,24 @@ impl Backend for Local {
 
     fn is_available(&self) -> bool {
         self.root.is_dir()
+    }
+
+    fn space(&self) -> Result<Option<Space>> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(&self.root).with_context(|| format!("backend {}: {}", self.name, self.root.display()))?;
+        let c = std::ffi::CString::new(self.root.as_os_str().as_bytes())?;
+        // SAFETY: percorso terminato da zero e struttura inizializzata da statvfs
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            bail!("backend {}: statvfs: {}", self.name, std::io::Error::last_os_error());
+        }
+        let unit = st.f_frsize as u64;
+        Ok(Some(Space {
+            free: st.f_bavail as u64 * unit,
+            total: Some(st.f_blocks as u64 * unit),
+            device: Some(meta.dev()),
+        }))
     }
 
     fn create(&self) -> Result<()> {

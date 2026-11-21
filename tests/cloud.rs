@@ -106,7 +106,10 @@ fn serve(handler: impl Fn(Req, &str) -> Resp + Send + Sync + 'static) -> String 
             let (path, query) = url.split_once('?').map(|(p, q)| (p.to_string(), q.to_string())).unwrap_or((url, String::new()));
             let headers = r.headers().iter().map(|h| (h.field.to_string().to_lowercase(), h.value.to_string())).collect();
             let req = Req { method: r.method().to_string(), path, query, headers, body };
-            let out = handler(req, &b);
+            let h = handler.clone();
+            let base = b.clone();
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || h(req, &base)))
+                .unwrap_or_else(|_| resp(500, "il server finto è andato in errore"));
             let mut response = tiny_http::Response::from_data(out.body).with_status_code(out.status);
             for (k, v) in out.headers {
                 response = response.with_header(tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap());
@@ -118,11 +121,17 @@ fn serve(handler: impl Fn(Req, &str) -> Resp + Send + Sync + 'static) -> String 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Spazio dichiarato dai servizi finti: 10 GB per tutti.
+
+const MOCK_QUOTA: u64 = 10_000_000_000;
+
+// ---------------------------------------------------------------------------------------------
 // WebDAV
 
 fn webdav_server(user: &'static str, pass: &'static str) -> String {
     let files: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::default();
     let dirs: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    let locked_once: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
     dirs.lock().unwrap().insert("/dav".into());
     let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
     serve(move |r, _| {
@@ -139,6 +148,8 @@ fn webdav_server(user: &'static str, pass: &'static str) -> String {
         let mut dirs = dirs.lock().unwrap();
         match r.method.as_str() {
             "MKCOL" if dirs.contains(&path) => resp(405, ""),
+            // come Koofr: la prima creazione di data/ trova la cartella "occupata" (423)
+            "MKCOL" if path.ends_with("/data") && locked_once.lock().unwrap().insert(path.clone()) => resp(423, "Locked"),
             "MKCOL" if !dirs.contains(&parent) => resp(409, "manca la cartella madre"),
             "MKCOL" => {
                 dirs.insert(path);
@@ -164,6 +175,17 @@ fn webdav_server(user: &'static str, pass: &'static str) -> String {
                 Some(_) => resp(204, ""),
                 None => resp(404, ""),
             },
+            "PROPFIND" if r.header("depth") == Some("0") => {
+                let used: u64 = files.values().map(|d| d.len() as u64).sum();
+                resp(
+                    207,
+                    format!(
+                        r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>{}/</d:href><d:propstat><d:prop><d:quota-available-bytes>{}</d:quota-available-bytes><d:quota-used-bytes>{used}</d:quota-used-bytes></d:prop></d:propstat></d:response></d:multistatus>"#,
+                        enc(&path),
+                        MOCK_QUOTA - used
+                    ),
+                )
+            }
             "PROPFIND" => {
                 assert_eq!(r.header("depth"), Some("1"), "solo profondità 1");
                 if !dirs.contains(&path) {
@@ -388,6 +410,10 @@ fn dropbox_server(oauth: Arc<Mutex<OAuthState>>) -> String {
         let path = arg.get("path").and_then(Value::as_str).unwrap_or_default().to_lowercase();
         let not_found = || json_resp(409, json!({"error_summary": "path/not_found/.."}));
         match r.path.as_str() {
+            "/2/users/get_space_usage" => {
+                let used: u64 = files.values().map(|d| d.len() as u64).sum();
+                json_resp(200, json!({"used": used, "allocation": {".tag": "individual", "allocated": MOCK_QUOTA}}))
+            }
             "/2/files/upload" => {
                 assert_eq!(arg["mode"], "overwrite");
                 // come Dropbox: le cartelle che contengono il file nascono e restano anche quando si svuotano
@@ -503,6 +529,10 @@ fn onedrive_server(oauth: Arc<Mutex<OAuthState>>) -> String {
         };
         let skip = r.q("skip").and_then(|s| s.parse().ok()).unwrap_or(0);
         match r.path.as_str() {
+            "/me/drive" => {
+                let used: u64 = files.values().map(|d| d.len() as u64).sum();
+                return json_resp(200, json!({"quota": {"total": MOCK_QUOTA, "used": used, "remaining": MOCK_QUOTA - used}}));
+            }
             "/me/drive/special/approot" => return json_resp(200, json!({"id": "approot"})),
             "/me/drive/special/approot/children" if r.method == "POST" => return json_resp(201, json!({"id": "f"})),
             "/me/drive/special/approot/children" => {
@@ -628,6 +658,10 @@ fn gdrive_server(oauth: Arc<Mutex<OAuthState>>) -> String {
         }
         let upload_type = r.q("uploadType");
         match (r.method.as_str(), path.as_str()) {
+            ("GET", "/drive/v3/about") => {
+                let used: u64 = st.items.values().map(|it| it.data.len() as u64).sum();
+                json_resp(200, json!({"storageQuota": {"limit": MOCK_QUOTA.to_string(), "usage": used.to_string()}}))
+            }
             ("GET", "/drive/v3/files") => {
                 let q = r.q("q").unwrap();
                 let page: usize = r.q("pageToken").and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -768,14 +802,14 @@ fn repository_su_cinque_servizi_cloud() {
     .unwrap();
     let add = |repo: &mut Repo, name: &str, kind: BackendKind, secrets: Vec<(&str, String)>| {
         let nb = NewBackend {
-            config: BackendConfig { name: name.into(), kind, delay_ms: 0 },
+            config: BackendConfig { name: name.into(), kind, delay_ms: 0, limit_gb: None },
             secrets: secrets.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
         };
         setup::add_backend(&config_path, repo, nb).unwrap_or_else(|e| panic!("{name}: {e:#}"));
     };
     // una password sbagliata viene scoperta dalla prova, e non resta niente
     let bad = NewBackend {
-        config: BackendConfig { name: "dav".into(), kind: BackendKind::Webdav { url: format!("{dav}/dav/repo"), user: "stefano".into() }, delay_ms: 0 },
+        config: BackendConfig { name: "dav".into(), kind: BackendKind::Webdav { url: format!("{dav}/dav/repo"), user: "stefano".into() }, delay_ms: 0, limit_gb: None },
         secrets: vec![("password".into(), "sbagliata".into())],
     };
     let err = setup::add_backend(&config_path, &mut repo, bad).unwrap_err();
@@ -906,7 +940,7 @@ fn backend_singoli_operazioni_di_base() {
     creds.set("dav", "password", Some("p")).unwrap();
     creds.set("s3", "secret_key", Some("segreto-s3")).unwrap();
     let backends = [
-        BackendConfig { name: "dav".into(), kind: BackendKind::Webdav { url: format!("{dav}/dav/a b"), user: "u".into() }, delay_ms: 0 },
+        BackendConfig { name: "dav".into(), kind: BackendKind::Webdav { url: format!("{dav}/dav/a b"), user: "u".into() }, delay_ms: 0, limit_gb: None },
         BackendConfig {
             name: "s3".into(),
             kind: BackendKind::S3 {
@@ -918,6 +952,7 @@ fn backend_singoli_operazioni_di_base() {
                 path_style: true,
             },
             delay_ms: 0,
+            limit_gb: None,
         },
     ];
     // i tre servizi con OAuth, collegati col flusso vero
@@ -935,17 +970,28 @@ fn backend_singoli_operazioni_di_base() {
     creds.set("gd", "refresh_token", Some(&link(Provider::Google, &gd, &o3, &apps))).unwrap();
     let gd_id = cloudraid::backend::gdrive_ensure_folder("gd", "cloudraid", Some(&gd), &apps, creds.clone()).unwrap();
     let mut backends = backends.to_vec();
-    backends.push(BackendConfig { name: "dbx".into(), kind: BackendKind::Dropbox { folder: String::new(), api_base: Some(dbx) }, delay_ms: 0 });
-    backends.push(BackendConfig { name: "od".into(), kind: BackendKind::Onedrive { folder: "sotto".into(), api_base: Some(od) }, delay_ms: 0 });
+    backends.push(BackendConfig { name: "dbx".into(), kind: BackendKind::Dropbox { folder: String::new(), api_base: Some(dbx) }, delay_ms: 0, limit_gb: None });
+    backends.push(BackendConfig { name: "od".into(), kind: BackendKind::Onedrive { folder: "sotto".into(), api_base: Some(od) }, delay_ms: 0, limit_gb: None });
     backends.push(BackendConfig {
         name: "gd".into(),
         kind: BackendKind::Gdrive { folder: "cloudraid".into(), folder_id: Some(gd_id), api_base: Some(gd) },
         delay_ms: 0,
+        limit_gb: None,
     });
     for bc in &backends {
         let b = open_one(bc, &apps, &creds);
         assert!(b.is_available() || bc.name != "gd", "{}", bc.name);
         probe(b.as_ref()).unwrap_or_else(|e| panic!("{}: {e:#}", bc.name));
+        // spazio dichiarato dal servizio (S3 non lo dice)
+        let space = b.space().unwrap_or_else(|e| panic!("{}: {e:#}", bc.name));
+        match bc.name.as_str() {
+            "s3" => assert!(space.is_none()),
+            name => {
+                let s = space.unwrap_or_else(|| panic!("{name}: spazio non letto"));
+                assert_eq!(s.total, Some(MOCK_QUOTA), "{name}");
+                assert!(s.free <= MOCK_QUOTA && s.free > MOCK_QUOTA - 1_000_000, "{name}: {s:?}");
+            }
+        }
         // la prova non lascia la sua cartella (dove il servizio ha cartelle vere)
         if let Some(base) = mock_base.get(bc.name.as_str()) {
             let dirs = ureq::get(&format!("{base}/__cartelle")).call().unwrap().into_string().unwrap();

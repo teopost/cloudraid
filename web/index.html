@@ -83,6 +83,22 @@
     </form>
   </dialog>
 
+  <dialog id="limit-dialog" class="dialog" aria-labelledby="limit-title">
+    <form id="limit-form" autocomplete="off">
+      <h3 id="limit-title">Limite di spazio</h3>
+      <p class="muted">Quanto spazio al massimo può usare cloudraid su questo servizio. Utile dove il servizio non dice quanto
+        spazio resta (S3) o per restare dentro una quota gratuita. Lascia vuoto per usare tutto lo spazio libero.</p>
+      <label class="field-label" for="limit-input">Limite in GB</label>
+      <input id="limit-input" name="limit_gb" type="text" inputmode="decimal" spellcheck="false" placeholder="nessun limite">
+      <p class="field-help">Per esempio 9 per un servizio gratuito da 10 GB.</p>
+      <p id="limit-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-ghost" data-action="limit-close">Annulla</button>
+        <button type="submit" class="btn btn-primary">Salva</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Procedura guidata per aggiungere uno spazio: fuori dalle viste, così gli aggiornamenti
        periodici della pagina non cancellano quello che si sta scrivendo -->
   <dialog id="wizard" class="dialog dialog-wide" aria-labelledby="wizard-title">

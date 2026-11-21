@@ -33,6 +33,7 @@ impl Lab {
                         name: format!("acc{i}"),
                         kind: BackendKind::Local { path },
                         delay_ms: 0,
+                        limit_gb: None,
                     }
                 })
                 .collect(),
@@ -328,15 +329,20 @@ fn indice_piu_recente_anche_se_un_backend_era_spento() {
     let samples = load_samples(&lab, &mut repo);
     drop(repo);
 
-    // il backend 0 è spento mentre si aggiunge un file (con 6 frammenti su 6 backend
-    // la scrittura deve essere rifiutata, non fatta a metà)
+    // il backend 0 è spento mentre si aggiunge un file: con 5 backend su 6 il file si scrive con
+    // 3 frammenti di dati + 2 di parità, quindi si possono ancora perdere 2 backend qualsiasi
     let off = lab.tmp.path().join("acc0-spento");
     fs::rename(lab.backend_dir(0), &off).unwrap();
     let mut repo = lab.open();
     let p = lab.src().join("nuovo.bin");
-    fs::write(&p, random("nuovo", 200_000)).unwrap();
-    let err = repo.put_file(&p, "nuovo.bin").unwrap_err();
-    assert!(format!("{err:#}").contains("servono 6 backend"), "{err:#}");
+    let nuovo = random("nuovo", 200_000);
+    fs::write(&p, &nuovo).unwrap();
+    repo.put_file(&p, "nuovo.bin").unwrap();
+    for id in &repo.index().files["nuovo.bin"].chunks {
+        let c = &repo.index().chunks[id];
+        assert_eq!((c.k, c.m, c.shards.len()), (3, 2, 5));
+        assert!(c.shards.iter().all(|s| s.backend != "acc0"));
+    }
     repo.remove("uno.bin").unwrap();
     repo.save().unwrap();
     drop(repo);
@@ -345,8 +351,8 @@ fn indice_piu_recente_anche_se_un_backend_era_spento() {
     fs::rename(&off, lab.backend_dir(0)).unwrap();
     let repo = lab.open();
     assert!(!repo.index().files.contains_key("uno.bin"));
-    assert!(!repo.index().files.contains_key("nuovo.bin"));
-    let rest: Vec<_> = samples.into_iter().filter(|(n, _)| n != "uno.bin").collect();
+    let mut rest: Vec<_> = samples.into_iter().filter(|(n, _)| n != "uno.bin").collect();
+    rest.push(("nuovo.bin".to_string(), nuovo));
     check_all(&lab, &repo, &rest);
 }
 
@@ -430,7 +436,7 @@ fn backend_aggiunto_riceve_la_chiave() {
     // un quarto account, aggiunto alla configurazione dopo init (cartella creata a mano)
     let path = lab.tmp.path().join("acc3");
     fs::create_dir_all(&path).unwrap();
-    lab.cfg.backends.push(BackendConfig { name: "acc3".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0 });
+    lab.cfg.backends.push(BackendConfig { name: "acc3".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0, limit_gb: None });
     let mut repo = lab.open();
     assert!(!path.join("cloudraid.key").exists());
     let p = lab.src().join("dopo.bin");
@@ -461,7 +467,7 @@ fn chiave_di_un_altro_repository_non_sovrascritta() {
     altro.init();
     let path = altro.backend_dir(0);
     let before = fs::read(path.join("cloudraid.key")).unwrap();
-    lab.cfg.backends.push(BackendConfig { name: "estraneo".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0 });
+    lab.cfg.backends.push(BackendConfig { name: "estraneo".into(), kind: BackendKind::Local { path: path.clone() }, delay_ms: 0, limit_gb: None });
     let mut repo = lab.open();
     repo.lock().unwrap();
     repo.remove("uno.bin").unwrap();
@@ -595,7 +601,7 @@ fn ribilanciamento_dopo_un_backend_aggiunto() {
     for i in 6..8 {
         let path = lab.tmp.path().join(format!("acc{i}"));
         fs::create_dir_all(&path).unwrap();
-        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0 });
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0, limit_gb: None });
     }
     let mut repo = lab.open();
     repo.lock().unwrap();
@@ -783,11 +789,184 @@ fn dismissione_rifiutata_con_pochi_backend() {
 fn prova_di_una_cartella_locale_senza_avanzi() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("disco");
-    let bc = BackendConfig { name: "disco".into(), kind: BackendKind::Local { path: root.clone() }, delay_ms: 0 };
+    let bc = BackendConfig { name: "disco".into(), kind: BackendKind::Local { path: root.clone() }, delay_ms: 0, limit_gb: None };
     let keys = std::sync::Arc::new(cloudraid::crypto::Keys::ephemeral());
     let creds = cloudraid::credentials::Credentials::load(None, keys).unwrap();
     let b = cloudraid::backend::open_one(&bc, &AppsConfig::default(), &creds);
     cloudraid::backend::probe(b.as_ref()).unwrap();
     assert!(root.is_dir(), "la cartella del repository resta");
     assert!(!root.join(cloudraid::backend::PROBE_DIR).exists(), "la cartella della prova è stata tolta");
+}
+
+/// Controlla che ogni blocco abbia i frammenti su backend tutti diversi e sempre 2 di parità.
+fn check_geometry(repo: &Repo) -> std::collections::BTreeSet<(u8, u8)> {
+    let mut geoms = std::collections::BTreeSet::new();
+    for c in repo.index().chunks.values() {
+        let set: std::collections::HashSet<&str> = c.shards.iter().map(|l| l.backend.as_str()).collect();
+        assert_eq!(set.len(), c.shards.len(), "frammenti dello stesso blocco sullo stesso backend");
+        assert_eq!(c.shards.len(), (c.k + c.m) as usize);
+        assert_eq!(c.m, 2, "la parità non cambia mai");
+        geoms.insert((c.k, c.m));
+    }
+    geoms
+}
+
+#[test]
+fn spazi_piccoli_pieni_e_spazi_grandi_ancora_usati() {
+    // sei spazi, due piccolissimi: con la distribuzione uguale il repository si fermerebbe a
+    // 4 volte il più piccolo (1,2 MB); qui si caricano 3 MB
+    let mut lab = Lab::new(6, 4, 2);
+    lab.cfg.backends[0].limit_gb = Some(0.000_3);
+    lab.cfg.backends[1].limit_gb = Some(0.000_6);
+    let mut repo = lab.init();
+    let mut samples = Vec::new();
+    for i in 0..6 {
+        let data = random(&format!("pezzo{i}"), 500_000);
+        let p = lab.src().join(format!("f{i}"));
+        fs::write(&p, &data).unwrap();
+        repo.put_file(&p, &format!("f{i}.bin")).unwrap();
+        samples.push((format!("f{i}.bin"), data));
+    }
+    repo.save().unwrap();
+    let l = loads(&repo, 6);
+    assert!(l[0] <= 300_000 && l[1] <= 600_000, "limiti rispettati: {l:?}");
+    assert!(l[0] > 200_000 && l[1] > 500_000, "spazi piccoli usati fino in fondo: {l:?}");
+    // quando gli spazi con posto sono 5 i blocchi diventano 3 + 2, poi 2 + 2
+    let geoms = check_geometry(&repo);
+    assert_eq!(geoms, [(2, 2), (3, 2), (4, 2)].into_iter().collect(), "{geoms:?}");
+    drop(repo);
+    check_all(&lab, &lab.open(), &samples);
+    // si possono sempre perdere 2 spazi qualsiasi: anche i due più carichi
+    lab.lose(4);
+    lab.lose(5);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn piu_spazi_i_grandi_ricevono_di_piu() {
+    // otto spazi di capienza diversa: ogni blocco va sui 6 con più posto, tutti 4 + 2 finché
+    // possibile, e nessuno supera il suo limite
+    let mut lab = Lab::new(8, 4, 2);
+    let limits = [0.000_4, 0.000_8, 0.001_5, 0.002, 0.002, 0.003, 0.003, 0.003];
+    for (b, gb) in lab.cfg.backends.iter_mut().zip(limits) {
+        b.limit_gb = Some(gb);
+    }
+    let mut repo = lab.init();
+    let before = repo.capacity_left().unwrap();
+    // con la distribuzione uguale: 4 volte il più piccolo (1,6 MB)
+    assert!(before > 8_000_000, "capacità stimata {before}");
+    let mut samples = Vec::new();
+    for i in 0..10 {
+        let data = random(&format!("blocco{i}"), 600_000);
+        let p = lab.src().join(format!("g{i}"));
+        fs::write(&p, &data).unwrap();
+        repo.put_file(&p, &format!("g{i}.bin")).unwrap();
+        samples.push((format!("g{i}.bin"), data));
+    }
+    repo.save().unwrap();
+    let l = loads(&repo, 8);
+    for (i, gb) in limits.iter().enumerate() {
+        assert!(l[i] as f64 <= gb * 1e9, "acc{i} oltre il limite: {l:?}");
+    }
+    assert!(l[7] > 3 * l[0], "i grandi lavorano di più: {l:?}");
+    let geoms = check_geometry(&repo);
+    assert!(geoms.contains(&(4, 2)), "{geoms:?}");
+    let left = repo.capacity_left().unwrap();
+    assert!(left < before - 5_000_000, "la stima scende: {before} -> {left}");
+    drop(repo);
+    lab.lose(6);
+    lab.lose(7);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn limite_abbassato_e_ribilanciamento() {
+    let mut lab = Lab::new(7, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    let before = loads(&repo, 7)[0];
+    assert!(before > 0);
+    drop(repo);
+    // acc0 ora può tenere solo metà di quello che ha: il ribilanciamento sposta il resto
+    lab.cfg.backends[0].limit_gb = Some(before as f64 / 2.0 / 1e9);
+    let mut repo = lab.open();
+    repo.lock().unwrap();
+    let r = repo.rebalance(false, &mut |_, _| {}).unwrap();
+    assert!(r.moved > 0 && r.failed == 0, "{r:?}");
+    let after = loads(&repo, 7)[0];
+    assert!(after <= before / 2, "{before} -> {after}");
+    check_geometry(&repo);
+    assert_eq!(repo.gc(true, &mut |_, _| {}).unwrap().orphans, 0);
+    drop(repo);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn al_massimo_due_frammenti_sullo_stesso_disco() {
+    // due dischi con tre cartelle ciascuno: quello delle cartelle temporanee e quello di cargo (nel
+    // container dei test sono filesystem diversi; se coincidono il test non ha senso e si salta).
+    // Con la regola "al massimo 2 frammenti di un blocco sullo stesso disco" i blocchi diventano
+    // 2 + 2, due frammenti per disco: si sopravvive alla perdita di un disco intero
+    use std::os::unix::fs::MetadataExt;
+    let other = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut lab = Lab::new(3, 4, 2);
+    if fs::metadata(lab.tmp.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+        eprintln!("un solo filesystem disponibile: test saltato");
+        return;
+    }
+    for i in 3..6 {
+        let path = other.path().join(format!("svc{i}"));
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0, limit_gb: None });
+    }
+    let repo = lab.init();
+    drop(repo);
+    let mut repo = lab.open();
+    let samples = load_samples(&lab, &mut repo);
+    for c in repo.index().chunks.values() {
+        let on = |range: std::ops::Range<usize>| {
+            c.shards.iter().filter(|l| range.contains(&l.backend.trim_start_matches("acc").parse::<usize>().unwrap())).count()
+        };
+        assert!(on(0..3) <= 2 && on(3..6) <= 2, "{:?}", c.shards.iter().map(|l| &l.backend).collect::<Vec<_>>());
+    }
+    let s = repo.status();
+    assert_eq!(s[0].same_device, ["acc1", "acc2"]);
+    drop(repo);
+    // perso un intero "disco" (tre cartelle), i file si leggono ancora
+    for i in 0..3 {
+        lab.lose(i);
+    }
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn backend_di_riserva_rispetta_il_disco() {
+    // tre cartelle sul disco dei test e cinque su quello di cargo; una di queste rifiuta le
+    // scritture: il frammento va su una riserva che non mette un terzo frammento sul primo disco
+    use std::os::unix::fs::MetadataExt;
+    let other = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut lab = Lab::new(3, 4, 2);
+    if fs::metadata(lab.tmp.path()).unwrap().dev() == fs::metadata(other.path()).unwrap().dev() {
+        eprintln!("un solo filesystem disponibile: test saltato");
+        return;
+    }
+    for i in 3..8 {
+        let path = other.path().join(format!("svc{i}"));
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path }, delay_ms: 0, limit_gb: None });
+    }
+    drop(lab.init());
+    // acc3 c'è ma non accetta frammenti: al posto della cartella data/ c'è un file
+    fs::write(other.path().join("svc3").join("data"), b"non una cartella").unwrap();
+    let mut repo = lab.open();
+    let samples = load_samples(&lab, &mut repo);
+    for c in repo.index().chunks.values() {
+        let first_disk = c
+            .shards
+            .iter()
+            .filter(|l| l.backend.trim_start_matches("acc").parse::<usize>().unwrap() < 3)
+            .count();
+        assert!(first_disk <= 2, "{:?}", c.shards.iter().map(|l| &l.backend).collect::<Vec<_>>());
+        assert!(c.shards.iter().all(|l| l.backend != "acc3"));
+    }
+    drop(repo);
+    check_all(&lab, &lab.open(), &samples);
 }

@@ -22,7 +22,7 @@ fn config(tmp: &Path) -> Config {
         dir: None,
         file: None,
         backends: (0..6)
-            .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) }, delay_ms: 0 })
+            .map(|i| BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path: tmp.join(format!("acc{i}")) }, delay_ms: 0, limit_gb: None })
             .collect(),
     }
 }

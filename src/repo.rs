@@ -30,6 +30,96 @@ const KEEP_INDEXES: usize = 3;
 /// Un lock non rinnovato da così tanto appartiene a un processo morto.
 pub const LOCK_STALE_SECS: u64 = 30 * 60;
 const LOCK_REFRESH_SECS: u64 = 5 * 60;
+/// Ogni quanto si richiede ai servizi lo spazio libero (nel frattempo si contano le scritture).
+const SPACE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Margine lasciato libero su ogni servizio che dichiara il suo spazio.
+const SPACE_RESERVE: i64 = 64 << 20;
+/// Spazio "senza limite noto" (servizio che non dichiara lo spazio e nessun limite in configurazione).
+const UNLIMITED: i64 = i64::MAX / 4;
+
+/// Quello che si sa dello spazio di un backend.
+#[derive(Clone, Debug, Default)]
+struct SpaceState {
+    /// Spazio libero dichiarato dal servizio; per più cartelle sullo stesso disco, la sua parte.
+    provider_free: Option<u64>,
+    provider_total: Option<u64>,
+    /// Altri backend sullo stesso disco.
+    peers: Vec<String>,
+    /// Il disco (solo cartelle locali).
+    device: Option<u64>,
+    /// Byte dei frammenti di questo repository secondo l'indice, al momento del controllo.
+    used: u64,
+    /// Byte scritti (o prenotati) da allora.
+    pending: u64,
+    /// Il servizio ha rifiutato una scrittura per mancanza di spazio.
+    full: bool,
+}
+
+#[derive(Default)]
+struct SpaceCache {
+    checked: Option<Instant>,
+    by_name: HashMap<String, SpaceState>,
+}
+
+/// Spazio ancora utilizzabile da cloudraid: il minimo fra quello libero sul servizio (meno un
+/// margine) e quello che resta sotto il limite della configurazione. Può essere negativo (oltre il
+/// limite): allora il backend cede frammenti al ribilanciamento.
+fn effective_free(st: Option<&SpaceState>, limit: Option<u64>) -> i64 {
+    let empty = SpaceState::default();
+    let st = st.unwrap_or(&empty);
+    if st.full {
+        return 0;
+    }
+    let pending = st.pending as i64;
+    let mut free = UNLIMITED;
+    if let Some(p) = st.provider_free {
+        free = free.min(p as i64 - SPACE_RESERVE - pending);
+    }
+    if let Some(l) = limit {
+        free = free.min(l as i64 - st.used as i64 - pending);
+    }
+    free
+}
+
+/// Lunghezza dei frammenti di un blocco cifrato di `len` byte diviso in `k` (come `erasure::encode`).
+fn shard_len_for(len: usize, k: usize) -> usize {
+    let s = len.div_ceil(k).max(2);
+    s + s % 2
+}
+
+/// Sceglie `n` backend da `order` (già in ordine di preferenza) con al massimo `max_per_device` sullo
+/// stesso disco; restituisce i scelti seguiti dagli altri (riserve), o `None` se non si arriva a `n`.
+fn pick_spread(order: &[usize], n: usize, max_per_device: usize, device: &dyn Fn(usize) -> Option<u64>) -> Option<Vec<usize>> {
+    let mut chosen = Vec::with_capacity(order.len());
+    let mut rest = Vec::new();
+    let mut per_device: HashMap<u64, usize> = HashMap::new();
+    for &bi in order {
+        let ok = chosen.len() < n
+            && match device(bi) {
+                None => true,
+                Some(d) => per_device.get(&d).copied().unwrap_or(0) < max_per_device,
+            };
+        if ok {
+            if let Some(d) = device(bi) {
+                *per_device.entry(d).or_default() += 1;
+            }
+            chosen.push(bi);
+        } else {
+            rest.push(bi);
+        }
+    }
+    if chosen.len() < n {
+        return None;
+    }
+    chosen.extend(rest);
+    Some(chosen)
+}
+
+/// L'errore dice che sul servizio non c'è più spazio?
+fn is_full_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_lowercase();
+    ["507", "insufficient", "quota", "no space left", "enospc"].iter().any(|w| msg.contains(w))
+}
 
 pub struct Repo {
     cfg: Config,
@@ -54,6 +144,8 @@ pub struct Repo {
     /// Data di modifica del file di configurazione quando l'abbiamo letto: se cambia (un altro
     /// processo ha aggiunto, tolto o rinominato un backend), chi prende il lock lo rilegge.
     config_seen: Option<std::time::SystemTime>,
+    /// Spazio libero dei backend (vedi `refresh_space`).
+    space: Mutex<SpaceCache>,
 }
 
 /// Data di modifica del file da cui viene la configurazione.
@@ -232,6 +324,15 @@ pub struct BackendStatus {
     pub available: bool,
     pub shards: u64,
     pub bytes: u64,
+    /// Spazio ancora utilizzabile da cloudraid (dal servizio e dal limite); `None` se non noto.
+    pub free: Option<u64>,
+    /// Spazio libero e capienza dichiarati dal servizio (per tutto l'account o il disco).
+    pub provider_free: Option<u64>,
+    pub provider_total: Option<u64>,
+    /// Limite della configurazione, in byte.
+    pub limit: Option<u64>,
+    /// Altri backend sullo stesso disco: un guasto del disco li toglie tutti insieme.
+    pub same_device: Vec<String>,
 }
 
 /// Il contenuto di un file `locks/<id>.json`.
@@ -326,6 +427,7 @@ impl Repo {
             keyfile_checked: HashSet::new(),
             latency: Arc::default(),
             config_seen: None,
+            space: Mutex::default(),
         };
         repo.config_seen = config_mtime(&repo.cfg);
         repo.save()?;
@@ -387,7 +489,9 @@ impl Repo {
             keyfile_checked: HashSet::new(),
             latency: Arc::default(),
             config_seen,
+            space: Mutex::default(),
         })
+        .inspect(|repo| repo.refresh_space())
     }
 
     /// Passa a una configurazione nuova (backend aggiunti o tolti) senza chiedere di nuovo la
@@ -408,6 +512,7 @@ impl Repo {
         if let Some(index) = self.newer_index(self.index.generation)? {
             self.index = index;
         }
+        self.refresh_space();
         Ok(())
     }
 
@@ -441,6 +546,9 @@ impl Repo {
         }
         if let Some(index) = self.newer_index(self.index.generation)? {
             self.index = index;
+        }
+        if self.space_stale() {
+            self.refresh_space();
         }
         Ok(())
     }
@@ -575,6 +683,9 @@ impl Repo {
                     self.index = index;
                 }
             }
+        }
+        if self.space_stale() {
+            self.refresh_space();
         }
         Ok(())
     }
@@ -976,23 +1087,215 @@ impl Repo {
         Ok(())
     }
 
-    /// Cifra un blocco, lo divide in k + m frammenti e li scrive in parallelo su backend tutti diversi.
+    // -----------------------------------------------------------------------------------------
+    // Spazio: ogni blocco va sui backend con più spazio libero, così quelli grandi lavorano di più
+    // e uno piccolo pieno non ferma le scritture.
+
+    /// Chiede a ogni backend lo spazio libero e ricalcola quello usato dal repository. Le cartelle
+    /// sullo stesso disco se ne dividono la capienza in parti uguali: ognuna ha come spazio libero
+    /// la sua parte meno quello che ha già usato (così fra loro si bilancia il carico).
+    pub fn refresh_space(&self) {
+        let load = self.shard_load();
+        let results = parallel(&self.backends, |b| if b.is_available() { Some(b.space()) } else { None });
+        let mut spaces: Vec<(String, Option<backend::Space>)> = Vec::new();
+        for (b, r) in self.backends.iter().zip(results) {
+            let s = match r {
+                Some(Ok(s)) => s,
+                Some(Err(e)) => {
+                    eprintln!("attenzione: {e:#}");
+                    None
+                }
+                None => None,
+            };
+            spaces.push((b.name().to_string(), s));
+        }
+        let mut groups: HashMap<u64, Vec<String>> = HashMap::new();
+        for (name, s) in &spaces {
+            if let Some(dev) = s.and_then(|s| s.device) {
+                groups.entry(dev).or_default().push(name.clone());
+            }
+        }
+        // per ogni disco: spazio libero più quello già usato dalle sue cartelle
+        let pool: HashMap<u64, u64> = groups
+            .iter()
+            .map(|(dev, names)| {
+                let free = spaces.iter().find(|(n, _)| *n == names[0]).and_then(|(_, s)| *s).map(|s| s.free).unwrap_or(0);
+                (*dev, free + names.iter().map(|n| load.get(n).copied().unwrap_or(0)).sum::<u64>())
+            })
+            .collect();
+        let mut cache = self.space.lock().unwrap();
+        cache.by_name = spaces
+            .into_iter()
+            .map(|(name, s)| {
+                let dev = s.and_then(|s| s.device);
+                let group = dev.and_then(|d| groups.get(&d)).cloned().unwrap_or_default();
+                let used = load.get(&name).copied().unwrap_or(0);
+                let free = match (s, dev) {
+                    (Some(_), Some(d)) => Some((pool[&d] / group.len().max(1) as u64).saturating_sub(used)),
+                    (Some(s), None) => Some(s.free),
+                    (None, _) => None,
+                };
+                let st = SpaceState {
+                    provider_free: free,
+                    provider_total: s.and_then(|s| s.total),
+                    peers: group.into_iter().filter(|n| *n != name).collect(),
+                    device: dev,
+                    used,
+                    pending: 0,
+                    full: false,
+                };
+                (name, st)
+            })
+            .collect();
+        cache.checked = Some(Instant::now());
+    }
+
+    /// Il disco di ogni backend (solo cartelle locali), nell'ordine di `backends`.
+    fn devices(&self) -> Vec<Option<u64>> {
+        let cache = self.space.lock().unwrap();
+        self.backends.iter().map(|b| cache.by_name.get(b.name()).and_then(|s| s.device)).collect()
+    }
+
+    /// Mettere un frammento del blocco su `b` porterebbe il suo disco oltre m frammenti?
+    fn crowds_device(&self, devices: &[Option<u64>], holders: &[usize], b: usize) -> bool {
+        match devices[b] {
+            None => false,
+            Some(d) => holders.iter().filter(|&&h| devices[h] == Some(d)).count() >= self.cfg.parity_shards,
+        }
+    }
+
+    fn space_stale(&self) -> bool {
+        self.space.lock().unwrap().checked.is_none_or(|t| t.elapsed() > SPACE_TTL)
+    }
+
+    fn limit_of(&self, name: &str) -> Option<u64> {
+        self.cfg.backends.iter().find(|b| b.name == name).and_then(|b| b.limit_bytes())
+    }
+
+    /// Spazio utilizzabile da cloudraid su ogni backend (indice di `backends`).
+    fn free_map(&self) -> HashMap<usize, i64> {
+        self.free_map_in(&self.space.lock().unwrap())
+    }
+
+    fn free_map_in(&self, cache: &SpaceCache) -> HashMap<usize, i64> {
+        self.backends
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (i, effective_free(cache.by_name.get(b.name()), self.limit_of(b.name()))))
+            .collect()
+    }
+
+    /// Conta `bytes` scritti (o, negativi, non più previsti) su un backend.
+    fn note_written(&self, bi: usize, bytes: i64) {
+        let mut cache = self.space.lock().unwrap();
+        let st = cache.by_name.entry(self.backends[bi].name().to_string()).or_default();
+        st.pending = (st.pending as i64 + bytes).max(0) as u64;
+    }
+
+    /// Un backend ha rifiutato una scrittura perché è pieno: niente frammenti nuovi fino al
+    /// prossimo controllo dello spazio.
+    fn mark_full(&self, bi: usize) {
+        let mut cache = self.space.lock().unwrap();
+        cache.by_name.entry(self.backends[bi].name().to_string()).or_default().full = true;
+    }
+
+    /// Quanti byte di file si possono ancora caricare, stimati simulando la distribuzione dei
+    /// blocchi (anche con meno frammenti di dati quando gli spazi con posto sono meno di k + m).
+    /// `None` se non c'è un limite noto (abbastanza backend senza spazio dichiarato né limite).
+    pub fn capacity_left(&self) -> Option<u64> {
+        let (k, m) = (self.cfg.data_shards, self.cfg.parity_shards);
+        let fm = self.free_map();
+        let devices: Vec<Option<u64>> = {
+            let cache = self.space.lock().unwrap();
+            self.backends.iter().map(|b| cache.by_name.get(b.name()).and_then(|s| s.device)).collect()
+        };
+        let writable = self.writable();
+        let mut free: Vec<i64> = writable.iter().map(|&bi| fm[&bi].max(0)).collect();
+        let device = |j: usize| devices[writable[j]];
+        let finite: i64 = free.iter().filter(|&&f| f < UNLIMITED / 2).sum();
+        // passo: abbastanza piccolo da essere preciso, abbastanza grande da finire presto
+        let unit = (finite / 4000).max(64 << 10);
+        let mut total: i64 = 0;
+        for _ in 0..200_000 {
+            let mut order: Vec<usize> = (0..free.len()).collect();
+            order.sort_unstable_by_key(|&j| std::cmp::Reverse(free[j]));
+            let mut placed = false;
+            'search: for max_per_device in [m, usize::MAX] {
+                for kk in (1..=k).rev() {
+                    let need = (unit + kk as i64 - 1) / kk as i64;
+                    let eligible: Vec<usize> = order.iter().copied().filter(|&j| free[j] >= need).collect();
+                    if let Some(chosen) = pick_spread(&eligible, kk + m, max_per_device, &device) {
+                        for &j in &chosen[..kk + m] {
+                            free[j] -= need;
+                        }
+                        total += unit;
+                        placed = true;
+                        break 'search;
+                    }
+                }
+            }
+            if !placed {
+                return Some(total as u64);
+            }
+        }
+        None
+    }
+
+    /// Cifra un blocco, lo divide in frammenti e li scrive in parallelo su backend tutti diversi,
+    /// scegliendo quelli con più spazio libero. Se meno di k + m backend hanno posto, il blocco
+    /// usa meno frammenti di dati (3 + 2, 2 + 2, 1 + 2 con k = 4, m = 2): la parità resta la stessa,
+    /// quindi si possono sempre perdere m backend qualsiasi; costa solo un po' più di spazio.
     fn store_chunk(&self, id: &str, plain: &[u8]) -> Result<ChunkEntry> {
         let (k, m) = (self.cfg.data_shards, self.cfg.parity_shards);
-        let n = k + m;
         let sealed = self.keys.seal(plain);
-        let (shard_len, shards) = erasure::encode(&sealed, k, m)?;
-
         let avail = self.writable();
-        if avail.len() < n {
+        if avail.len() < m + 1 {
             bail!(
-                "servono {n} backend disponibili e non in dismissione ({k} dati + {m} parità), ce ne sono {}: scrittura annullata",
+                "servono almeno {} backend disponibili e non in dismissione ({m} di parità più uno di dati), ce ne sono {}: scrittura annullata",
+                m + 1,
                 avail.len()
             );
         }
-        // si parte da un backend che dipende dall'id, così i frammenti di dati si distribuiscono
+        // ordine: più spazio libero prima; a parità (stesso disco, spazio non noto) si ruota secondo
+        // l'id, così i frammenti si distribuiscono
         let start = usize::from_str_radix(&id[..4], 16)? % avail.len();
-        let order: Vec<usize> = (0..avail.len()).map(|j| avail[(start + j) % avail.len()]).collect();
+        // scelta e prenotazione dello spazio insieme: i blocchi scritti in parallelo non si
+        // contendono lo stesso posto
+        let mut cache = self.space.lock().unwrap();
+        let free = self.free_map_in(&cache);
+        let mut cands: Vec<(usize, i64, usize)> =
+            avail.iter().enumerate().map(|(j, &bi)| (bi, free[&bi], (j + avail.len() - start) % avail.len())).collect();
+        cands.sort_by_key(|&(_, f, rot)| (std::cmp::Reverse(f), rot));
+        // al massimo m frammenti dello stesso blocco sullo stesso disco: così un disco guasto non
+        // costa più della parità. Se non si può (solo cartelle sullo stesso disco), senza vincolo.
+        let devices: HashMap<usize, Option<u64>> =
+            avail.iter().map(|&bi| (bi, cache.by_name.get(self.backends[bi].name()).and_then(|s| s.device))).collect();
+        let device = |bi: usize| devices.get(&bi).copied().flatten();
+        let mut plan = None;
+        'search: for max_per_device in [m, usize::MAX] {
+            for kk in (1..=k).rev() {
+                let need = shard_len_for(sealed.len(), kk) as i64;
+                let eligible: Vec<usize> = cands.iter().filter(|c| c.1 >= need).map(|c| c.0).collect();
+                if let Some(order) = pick_spread(&eligible, kk + m, max_per_device, &device) {
+                    plan = Some((kk, order));
+                    break 'search;
+                }
+            }
+        }
+        let Some((k, order)) = plan else {
+            bail!(
+                "spazio esaurito: servono almeno {} spazi con posto libero e non ci sono (aggiungi uno spazio o alza un limite)",
+                m + 1
+            );
+        };
+        let n = k + m;
+        let shard_len = shard_len_for(sealed.len(), k);
+        for &bi in &order[..n] {
+            cache.by_name.entry(self.backends[bi].name().to_string()).or_default().pending += shard_len as u64;
+        }
+        drop(cache);
+        let (encoded_len, shards) = erasure::encode(&sealed, k, m)?;
+        debug_assert_eq!(encoded_len, shard_len);
 
         let jobs: Vec<usize> = (0..n).collect();
         let first = parallel(&jobs, |&i| self.backends[order[i]].put(&shard_key(id, i), &shards[i]));
@@ -1000,24 +1303,44 @@ impl Repo {
         for (i, res) in first.into_iter().enumerate() {
             match res {
                 Ok(()) => placed[i] = Some(order[i]),
-                Err(e) => eprintln!("attenzione: {e:#}; provo un altro backend"),
+                Err(e) => {
+                    eprintln!("attenzione: {e:#}; provo un altro backend");
+                    self.note_written(order[i], -(shard_len as i64));
+                    if is_full_error(&e) {
+                        self.mark_full(order[i]);
+                    }
+                }
             }
         }
-        // i frammenti falliti vanno sui backend di riserva, se ce ne sono
-        let mut spares = order[n..].iter().copied();
+        // i frammenti falliti vanno sui backend di riserva, se ce ne sono: prima quelli che non mettono
+        // più di m frammenti del blocco sullo stesso disco
+        let mut spares: Vec<usize> = order[n..].to_vec();
         for i in 0..n {
             while placed[i].is_none() {
-                let Some(bi) = spares.next() else {
+                let holders: Vec<usize> = placed.iter().flatten().copied().collect();
+                let devices = self.devices();
+                spares.sort_by_key(|&b| self.crowds_device(&devices, &holders, b));
+                let next = if spares.is_empty() { None } else { Some(spares.remove(0)) };
+                let Some(bi) = next else {
                     for (j, bi) in placed.iter().enumerate() {
                         if let Some(bi) = bi {
                             let _ = self.backends[*bi].delete(&shard_key(id, j));
+                            self.note_written(*bi, -(shard_len as i64));
                         }
                     }
                     bail!("impossibile scrivere il blocco {}: troppi backend in errore", &id[..12]);
                 };
                 match self.backends[bi].put(&shard_key(id, i), &shards[i]) {
-                    Ok(()) => placed[i] = Some(bi),
-                    Err(e) => eprintln!("attenzione: {e:#}"),
+                    Ok(()) => {
+                        placed[i] = Some(bi);
+                        self.note_written(bi, shard_len as i64);
+                    }
+                    Err(e) => {
+                        eprintln!("attenzione: {e:#}");
+                        if is_full_error(&e) {
+                            self.mark_full(bi);
+                        }
+                    }
                 }
             }
         }
@@ -1365,8 +1688,12 @@ impl Repo {
         load
     }
 
-    /// Decide gli spostamenti: da un backend sopra la media al più scarico fra quelli sotto la media che
-    /// non hanno già un frammento dello stesso blocco, solo se lo squilibrio diminuisce davvero.
+    /// Decide gli spostamenti in base allo spazio libero: per ogni blocco, il suo frammento sul
+    /// backend con meno spazio libero passa a quello con più spazio libero che non ha già un
+    /// frammento dello stesso blocco, solo se la differenza è grande abbastanza da valerne il
+    /// traffico. Così si libera spazio sui servizi piccoli e si usano quelli grandi; un backend oltre
+    /// il suo limite cede frammenti per primo. Con backend di spazio uguale (o non noto e senza
+    /// limite) il risultato è un carico uguale.
     fn plan_rebalance(&self) -> (Vec<Move>, HashMap<String, u64>) {
         let mut load = self.shard_load();
         // i backend in dismissione non partecipano: li svuota `retire`
@@ -1376,36 +1703,73 @@ impl Repo {
         if avail.len() < 2 {
             return (Vec::new(), load);
         }
-        let total: u64 = avail.iter().map(|&i| load[&names[i]]).sum();
-        let target = total / avail.len() as u64;
-        // ruoli fissati all'inizio: chi è sopra la media cede soltanto, chi è sotto riceve soltanto.
-        // Così nessun byte fa giri inutili (un backend che cede troppo non si fa ridare frammenti).
-        // Uno scarto entro il 5% della media non vale il traffico: ripetere il comando non sposta niente
-        let tolerance = target / 20;
-        let donors: Vec<usize> = avail.iter().copied().filter(|&b| load[&names[b]] > target + tolerance).collect();
-        let receivers: Vec<usize> =
-            avail.iter().copied().filter(|&b| load[&names[b]] + tolerance < target).collect();
+        let fm = self.free_map();
+        let devices: Vec<Option<u64>> = {
+            let cache = self.space.lock().unwrap();
+            self.backends.iter().map(|b| cache.by_name.get(b.name()).and_then(|s| s.device)).collect()
+        };
+        let m = self.cfg.parity_shards;
+        // con spazio non noto si confronta il carico (meno carico = più libero)
+        let mut free: HashMap<usize, i64> = avail
+            .iter()
+            .map(|&b| (b, if fm[&b] >= UNLIMITED / 2 { UNLIMITED / 2 - load[&names[b]] as i64 } else { fm[&b] }))
+            .collect();
+        // uno scarto entro il 5% del carico medio non vale il traffico: ripetere il comando non sposta niente
+        let total: u64 = avail.iter().map(|&b| load[&names[b]]).sum();
+        let tolerance = (total / avail.len() as u64 / 20) as i64;
         let mut moves = Vec::new();
-        for (id, c) in &self.index.chunks {
-            let mut holders: HashSet<usize> = c.shards.iter().filter_map(|l| pos.get(l.backend.as_str()).copied()).collect();
-            for (i, loc) in c.shards.iter().enumerate() {
-                let Some(&from) = pos.get(loc.backend.as_str()) else { continue };
-                if !avail.contains(&from) || load[&names[from]] <= target {
-                    continue;
+        // dove saranno i frammenti di ogni blocco dopo gli spostamenti già decisi
+        let mut planned: HashMap<&str, Vec<Option<usize>>> = HashMap::new();
+        let mut moved_shards: HashSet<(String, usize)> = HashSet::new();
+        for _pass in 0..8 {
+            let mut changed = false;
+            for (id, c) in &self.index.chunks {
+                let len = c.shard_len as i64;
+                let locs = planned
+                    .entry(id.as_str())
+                    .or_insert_with(|| c.shards.iter().map(|l| pos.get(l.backend.as_str()).copied()).collect());
+                let holders: HashSet<usize> = locs.iter().flatten().copied().collect();
+                let mut per_device: HashMap<u64, usize> = HashMap::new();
+                for d in locs.iter().flatten().filter_map(|&b| devices[b]) {
+                    *per_device.entry(d).or_default() += 1;
                 }
-                if !donors.contains(&from) {
-                    continue;
-                }
-                let best = receivers.iter().copied().filter(|b| !holders.contains(b)).min_by_key(|&b| (load[&names[b]], b));
-                let Some(to) = best else { continue };
-                if load[&names[to]] >= target || load[&names[to]] + c.shard_len >= load[&names[from]] {
-                    continue;
-                }
+                // un disco con più di m frammenti del blocco: uno va spostato altrove, anche se costa
+                let crowded = per_device.iter().find(|(_, &c)| c > m).map(|(&d, _)| d);
+                // prima, se un disco ha più di m frammenti del blocco, uno di quelli va altrove (anche se
+                // costa traffico); altrimenti il frammento sul backend più pieno va su quello più libero
+                let pick = |crowded: Option<u64>| -> Option<(usize, usize, usize)> {
+                    let (i, from) = locs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, b)| b.map(|b| (i, b)))
+                        .filter(|(i, b)| free.contains_key(b) && !moved_shards.contains(&(id.clone(), *i)))
+                        .filter(|&(_, b)| crowded.is_none() || devices[b] == crowded)
+                        .min_by_key(|&(_, b)| (free[&b], b))?;
+                    let fits = |b: usize| match devices[b] {
+                        None => true,
+                        Some(d) => devices[from] == Some(d) || per_device.get(&d).copied().unwrap_or(0) < m,
+                    };
+                    let to = avail
+                        .iter()
+                        .copied()
+                        .filter(|&b| !holders.contains(&b) && fits(b) && (crowded.is_none() || devices[b] != crowded))
+                        .max_by_key(|&b| (free[&b], std::cmp::Reverse(b)))?;
+                    let worth = crowded.is_some() || free[&to] - len > free[&from] + len + tolerance;
+                    (free[&to] >= len && worth).then_some((i, from, to))
+                };
+                let found = crowded.and_then(|d| pick(Some(d))).or_else(|| pick(None));
+                let Some((i, from, to)) = found else { continue };
+                *free.get_mut(&from).unwrap() += len;
+                *free.get_mut(&to).unwrap() -= len;
                 *load.get_mut(&names[from]).unwrap() -= c.shard_len;
                 *load.get_mut(&names[to]).unwrap() += c.shard_len;
-                holders.remove(&from);
-                holders.insert(to);
+                locs[i] = Some(to);
+                moved_shards.insert((id.clone(), i));
                 moves.push(Move { id: id.clone(), shard: i, from, to, len: c.shard_len });
+                changed = true;
+            }
+            if !changed {
+                break;
             }
         }
         (moves, load)
@@ -1455,11 +1819,16 @@ impl Repo {
                     Shard::Ok(data) => data,
                     _ => self.rebuild_shard(&mv.id, entry, mv.shard)?,
                 };
-                self.backends[mv.to].put(&key, &data)
+                self.backends[mv.to].put(&key, &data).inspect_err(|e| {
+                    if is_full_error(e) {
+                        self.mark_full(mv.to);
+                    }
+                })
             });
             for (mv, res) in batch.iter().zip(results) {
                 match res {
                     Ok(()) => {
+                        self.note_written(mv.to, mv.len as i64);
                         let to = self.backends[mv.to].name().to_string();
                         let key = shard_key(&mv.id, mv.shard);
                         self.index.chunks.get_mut(&mv.id).expect("blocco presente").shards[mv.shard].backend = to;
@@ -1542,8 +1911,12 @@ impl Repo {
             self.dirty = true;
             self.save()?;
         }
-        // il piano: ogni frammento sul backend va al meno carico fra quelli che possono riceverlo
+        // il piano: ogni frammento sul backend va a quello con più spazio libero fra quelli che possono
+        // riceverlo (a parità, il meno carico)
         let mut load = self.shard_load();
+        let mut free = self.free_map();
+        let devices = self.devices();
+        let pos: HashMap<String, usize> = self.backends.iter().enumerate().map(|(i, b)| (b.name().to_string(), i)).collect();
         let targets = self.writable();
         let mut moves = Vec::new();
         let mut stuck = 0u64;
@@ -1553,17 +1926,22 @@ impl Repo {
                 if loc.backend != name {
                     continue;
                 }
+                let others: Vec<usize> =
+                    holders.iter().filter(|h| **h != name).filter_map(|h| pos.get(*h).copied()).collect();
                 let best = targets
                     .iter()
                     .copied()
-                    .filter(|&b| !holders.contains(self.backends[b].name()))
-                    .min_by_key(|&b| (load[self.backends[b].name()], b));
+                    .filter(|&b| !holders.contains(self.backends[b].name()) && free[&b] >= c.shard_len as i64)
+                    .min_by_key(|&b| {
+                        (self.crowds_device(&devices, &others, b), std::cmp::Reverse(free[&b]), load[self.backends[b].name()], b)
+                    });
                 let Some(to) = best else {
                     stuck += 1;
                     continue;
                 };
                 let to_name = self.backends[to].name();
                 *load.get_mut(to_name).unwrap() += c.shard_len;
+                *free.get_mut(&to).unwrap() -= c.shard_len as i64;
                 holders.insert(to_name);
                 moves.push(Move { id: id.clone(), shard: i, from: bi, to, len: c.shard_len });
             }
@@ -1610,10 +1988,18 @@ impl Repo {
     }
 
     pub fn status(&self) -> Vec<BackendStatus> {
+        let fm = self.free_map();
+        let cache = self.space.lock().unwrap().by_name.clone();
         let mut out: Vec<BackendStatus> = self
             .backends
             .iter()
-            .map(|b| BackendStatus {
+            .enumerate()
+            .map(|(bi, b)| BackendStatus {
+                free: (fm[&bi] < UNLIMITED / 2).then(|| fm[&bi].max(0) as u64),
+                provider_free: cache.get(b.name()).and_then(|s| s.provider_free),
+                provider_total: cache.get(b.name()).and_then(|s| s.provider_total),
+                limit: self.limit_of(b.name()),
+                same_device: cache.get(b.name()).map(|s| s.peers.clone()).unwrap_or_default(),
                 latency_ms: self.latency.lock().unwrap().get(b.name()).copied(),
                 retired: self.index.retired.contains(b.name()),
                 name: b.name().to_string(),
@@ -1733,25 +2119,52 @@ impl Repo {
             let holders: HashSet<&str> =
                 entry.shards.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, l)| l.backend.as_str()).collect();
             let original = entry.shards[i].backend.clone();
-            // prima il backend originale, poi gli altri liberi, dal meno carico
-            let mut candidates: Vec<&dyn Backend> = self
-                .backends
+            // prima il backend originale, poi quelli con più spazio libero (a parità, il meno carico)
+            let free = self.free_map();
+            let devices = self.devices();
+            let others: Vec<usize> = entry
+                .shards
                 .iter()
-                .map(|b| b.as_ref())
-                .filter(|b| b.is_available() && !holders.contains(b.name()) && !self.index.retired.contains(b.name()))
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .filter_map(|(_, l)| self.backends.iter().position(|b| b.name() == l.backend))
                 .collect();
-            candidates.sort_by_key(|b| (b.name() != original, load.get(b.name()).copied().unwrap_or(0)));
+            let len = entry.shard_len as i64;
+            let mut candidates: Vec<usize> = (0..self.backends.len())
+                .filter(|&b| {
+                    let be = &self.backends[b];
+                    be.is_available()
+                        && !holders.contains(be.name())
+                        && !self.index.retired.contains(be.name())
+                        && (be.name() == original || free[&b] >= len)
+                })
+                .collect();
+            candidates.sort_by_key(|&b| {
+                let name = self.backends[b].name();
+                (
+                    name != original,
+                    self.crowds_device(&devices, &others, b),
+                    std::cmp::Reverse(free[&b]),
+                    load.get(name).copied().unwrap_or(0),
+                )
+            });
             let key = shard_key(id, i);
-            let target = candidates.into_iter().find(|b| match b.put(&key, &rebuilt[i]) {
-                Ok(()) => true,
+            let target = candidates.into_iter().find(|&b| match self.backends[b].put(&key, &rebuilt[i]) {
+                Ok(()) => {
+                    self.note_written(b, len);
+                    true
+                }
                 Err(e) => {
                     eprintln!("attenzione: {e:#}");
+                    if is_full_error(&e) {
+                        self.mark_full(b);
+                    }
                     false
                 }
             });
             match target {
                 Some(b) => {
-                    let name = b.name().to_string();
+                    let name = self.backends[b].name().to_string();
                     if name != original {
                         if let Some(n) = load.get_mut(&original) {
                             *n = n.saturating_sub(1);

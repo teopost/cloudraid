@@ -74,6 +74,17 @@ pub struct BackendConfig {
     /// Solo per prove: ritardo artificiale in millisecondi su ogni lettura, per simulare un account lento.
     #[serde(default)]
     pub delay_ms: u64,
+    /// Spazio massimo che cloudraid può usare su questo backend, in GB (miliardi di byte). Facoltativo:
+    /// serve dove il servizio non dice quanto spazio resta (S3) o per restare dentro una quota gratuita.
+    #[serde(default)]
+    pub limit_gb: Option<f64>,
+}
+
+impl BackendConfig {
+    /// Il limite in byte, se impostato.
+    pub fn limit_bytes(&self) -> Option<u64> {
+        self.limit_gb.map(|gb| (gb * 1e9) as u64)
+    }
 }
 
 /// I tipi di backend. Password, chiavi segrete e token non stanno qui ma nelle credenziali
@@ -216,6 +227,11 @@ impl Config {
             }
             if !names.insert(b.name.as_str()) {
                 bail!("nome di backend ripetuto: {}", b.name);
+            }
+            if let Some(gb) = b.limit_gb {
+                if !gb.is_finite() || gb <= 0.0 {
+                    bail!("backend {}: limit_gb deve essere un numero di GB maggiore di zero", b.name);
+                }
             }
             match &b.kind {
                 BackendKind::Webdav { url, .. } if !(url.starts_with("https://") || url.starts_with("http://")) => {

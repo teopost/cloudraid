@@ -66,6 +66,9 @@ fn backend_table(b: &BackendConfig) -> Table {
     if b.delay_ms > 0 {
         t["delay_ms"] = value(b.delay_ms as i64);
     }
+    if let Some(gb) = b.limit_gb {
+        t["limit_gb"] = value(gb);
+    }
     t
 }
 
@@ -222,6 +225,33 @@ pub fn rename_backend(config_path: &Path, repo: &mut Repo, old: &str, new: &str)
         return Err(e);
     }
     Ok(())
+}
+
+/// Imposta (o, con `None`, toglie) il limite di spazio di un backend, in GB. I frammenti già
+/// scritti restano dove sono: se il backend è oltre il nuovo limite, il ribilanciamento li sposta.
+pub fn set_limit(config_path: &Path, repo: &mut Repo, name: &str, limit_gb: Option<f64>) -> Result<()> {
+    if limit_gb.is_some_and(|gb| !gb.is_finite() || gb <= 0.0) {
+        bail!("il limite deve essere un numero di GB maggiore di zero");
+    }
+    if !repo.config().backends.iter().any(|b| b.name == name) {
+        bail!("{name} non è nella configurazione");
+    }
+    let name = name.to_string();
+    let cfg = edit_config(config_path, move |doc| {
+        let arr = backends_mut(doc)?;
+        let t = arr
+            .iter_mut()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+            .ok_or_else(|| anyhow!("{name} non trovato nel file"))?;
+        match limit_gb {
+            Some(gb) => t["limit_gb"] = value(gb),
+            None => {
+                t.remove("limit_gb");
+            }
+        }
+        Ok(())
+    })?;
+    repo.reconfigure(cfg)
 }
 
 /// Imposta (o, con stringa vuota, toglie) i valori della sezione `[apps]`.

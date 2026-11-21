@@ -18,12 +18,16 @@ Piani gratuiti verificati il **21/11/2026**. Cambiano spesso, quindi controllali
 
 ## Prima di cominciare
 
-- **Lo spazio più piccolo limita gli altri.** Ogni blocco diventa 6 frammenti (4 di dati e 2 di parità), ciascuno su
-  uno spazio diverso. Con 6 spazi esatti, la capacità utile è circa 4 volte quella dello spazio più piccolo. Con più di
-  6 spazi il ribilanciamento distribuisce meglio, e quelli piccoli pesano meno.
+- **Spazi grandi e piccoli insieme vanno bene.** Ogni blocco va sugli spazi con più posto libero: cloudraid lo legge dal
+  servizio (Dropbox, OneDrive, Google Drive, WebDAV, dischi locali). Quando uno spazio piccolo è pieno viene saltato, e
+  se gli spazi con posto sono meno di 6 i file nuovi usano 3 + 2 frammenti (poi 2 + 2...): occupano un po' di più, ma
+  si possono sempre perdere 2 spazi qualsiasi. Con più di 6 spazi la capacità cresce meglio. La pagina Spazi mostra
+  quanto si può ancora caricare.
+- **Limite per spazio.** Con **Limite**, in Spazi, si decide quanti GB al massimo cloudraid può usare su un servizio.
+  Serve per S3 (che non dice quanto spazio resta) e per restare dentro una quota gratuita.
 - **Servizi che chiedono la carta di credito** (Cloudflare R2, Oracle, IDrive e2, Google Cloud Storage). Oltre la quota
-  gratuita fanno pagare, e oggi cloudraid **non ha ancora un limite di spazio per servizio**: tieni d'occhio
-  l'occupazione nella pagina Spazi.
+  gratuita fanno pagare, e non dicono quanto spazio resta: imposta **sempre un limite**, per esempio 9 GB per una quota
+  gratuita da 10 GB.
 - **Un solo account per servizio.** Più account sullo stesso provider spesso violano le condizioni d'uso. Soprattutto,
   non danno ridondanza vera: se quel provider ha un guasto, li perdi tutti insieme.
 - **Non toccare i file sugli spazi.** Nella cartella `cloudraid` di ogni servizio ci sono frammenti cifrati con nomi
@@ -352,5 +356,3 @@ In ordine di convenienza:
 4. **MEGA** (20 GB): molto spazio, ma il protocollo è il più complesso e i limiti di trasferimento lo rendono poco
    prevedibile.
 
-Prima di questi, conviene aggiungere a cloudraid un **limite di spazio per servizio** (es. "B2: massimo 9 GB"): così
-non si supera mai una quota gratuita, e i servizi con la carta di credito diventano sicuri da usare.

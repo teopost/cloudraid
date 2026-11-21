@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use super::http::{self, Availability, Outcome, Step};
 use super::oauth::{Provider, TokenSource};
-use super::Backend;
+use super::{Backend, Space};
 use crate::config::AppsConfig;
 use crate::credentials::Credentials;
 use crate::crypto::random_hex;
@@ -369,6 +369,25 @@ impl Backend for GDrive {
         )?;
         self.files.lock().unwrap().remove(key);
         Ok(())
+    }
+
+    fn space(&self) -> Result<Option<Space>> {
+        let url = format!("{}/drive/v3/about?fields=storageQuota", self.api);
+        let v: Value = self.call(
+            "spazio dell'account",
+            |token| (http::agent().get(&url).set("Authorization", &format!("Bearer {token}")), None),
+            |r| match r.status() {
+                200 => match http::body(r) {
+                    Ok(b) => Step::Done(serde_json::from_slice(&b).unwrap_or(Value::Null)),
+                    Err(e) => Step::Retry(e, None),
+                },
+                s => Step::Fail(anyhow!("risposta {s}: {}", http::body_text(r))),
+            },
+        )?;
+        // numeri come stringhe; senza "limit" lo spazio è illimitato (account aziendali)
+        let num = |k: &str| v["storageQuota"][k].as_str().and_then(|s| s.parse::<u64>().ok());
+        let (Some(limit), Some(usage)) = (num("limit"), num("usage")) else { return Ok(None) };
+        Ok(Some(Space { free: limit.saturating_sub(usage), total: Some(limit), device: None }))
     }
 
     fn remove_dir(&self, dir: &str) -> Result<()> {

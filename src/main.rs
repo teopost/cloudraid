@@ -219,8 +219,13 @@ fn cmd_status(repo: &Repo, cfg: &Config) {
         ix.chunks.len()
     );
     for b in repo.status() {
+        let free = match b.free {
+            Some(f) => format!("{} liberi", human(f)),
+            None => "spazio non noto".into(),
+        };
+        let limit = b.limit.map(|l| format!(", limite {}", human(l))).unwrap_or_default();
         println!(
-            "  {:<12} {:<15} {:>8} frammenti {:>10}  {}",
+            "  {:<12} {:<15} {:>8} frammenti {:>10}  {:>16}{}  {}",
             b.name,
             match (b.available, b.retired) {
                 (true, false) => "disponibile",
@@ -230,8 +235,17 @@ fn cmd_status(repo: &Repo, cfg: &Config) {
             },
             b.shards,
             human(b.bytes),
+            free,
+            limit,
             b.location
         );
+        if !b.same_device.is_empty() {
+            println!("  {:<12} attenzione: sullo stesso disco di {}", "", b.same_device.join(", "));
+        }
+    }
+    match repo.capacity_left() {
+        Some(c) => println!("si possono ancora caricare circa {} di file (stima)", human(c)),
+        None => println!("spazio per nuovi file: nessun limite noto"),
     }
     for l in repo.locks() {
         let age = now().saturating_sub(l.time);

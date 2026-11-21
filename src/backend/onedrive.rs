@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::http::{self, Availability, Outcome, Step};
 use super::oauth::{Provider, TokenSource};
-use super::Backend;
+use super::{Backend, Space};
 use crate::config::AppsConfig;
 use crate::credentials::Credentials;
 
@@ -217,6 +217,26 @@ impl Backend for OneDrive {
                 s => Step::Fail(anyhow!("risposta {s}: {}", http::body_text(r))),
             },
         )
+    }
+
+    fn space(&self) -> Result<Option<Space>> {
+        let url = format!("{}/me/drive?$select=quota", self.graph);
+        let v = self.call(
+            "spazio dell'account",
+            |token| (http::agent().get(&url).set("Authorization", &format!("Bearer {token}")), None),
+            |r| match r.status() {
+                200 => match http::body(r) {
+                    Ok(b) => Step::Done(serde_json::from_slice::<Value>(&b).ok()),
+                    Err(e) => Step::Retry(e, None),
+                },
+                // con il solo permesso sulla cartella dell'app alcuni account non mostrano la quota
+                401 | 403 | 404 => Step::Done(None),
+                s => Step::Fail(anyhow!("risposta {s}: {}", http::body_text(r))),
+            },
+        )?;
+        let Some(q) = v.as_ref().map(|v| &v["quota"]) else { return Ok(None) };
+        let Some(free) = q["remaining"].as_u64() else { return Ok(None) };
+        Ok(Some(Space { free, total: q["total"].as_u64(), device: None }))
     }
 
     fn remove_dir(&self, dir: &str) -> Result<()> {

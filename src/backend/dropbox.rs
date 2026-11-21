@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::http::{self, Availability, Outcome, Step};
 use super::oauth::{Provider, TokenSource};
-use super::Backend;
+use super::{Backend, Space};
 use crate::config::AppsConfig;
 use crate::credentials::Credentials;
 
@@ -255,6 +255,17 @@ impl Backend for Dropbox {
             Err(e) if e.contains("not_found") => Ok(()),
             Err(e) => Err(anyhow!("backend {}: cancellazione di {key}: {e}", self.name)),
         }
+    }
+
+    fn space(&self) -> Result<Option<Space>> {
+        let v = match self.rpc("spazio dell'account", "users/get_space_usage", Value::Null)? {
+            Ok(v) => v,
+            Err(e) => return Err(anyhow!("backend {}: spazio dell'account: {e}", self.name)),
+        };
+        let used = v["used"].as_u64().unwrap_or(0);
+        // account personale: allocation.allocated; team: allocation.allocated è lo spazio del team
+        let Some(total) = v["allocation"]["allocated"].as_u64() else { return Ok(None) };
+        Ok(Some(Space { free: total.saturating_sub(used), total: Some(total), device: None }))
     }
 
     fn remove_dir(&self, dir: &str) -> Result<()> {

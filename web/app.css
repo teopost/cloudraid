@@ -324,3 +324,10 @@ td.msg { max-width: 420px; }
   .space { grid-template-columns: 1fr; }
   .space-side { align-items: flex-start; text-align: left; }
 }
+
+/* spazio degli spazi */
+.space-usage { grid-column: 1 / -1; display: grid; gap: .3rem; }
+.space-usage .bar { height: 6px; }
+.space-warn { margin: 0; font-size: .85rem; color: var(--warn); display: flex; gap: .35rem; align-items: center; }
+.space-warn svg { width: 1em; height: 1em; flex: none; }
+.capacity { margin: .6rem 0 0; }
