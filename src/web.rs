@@ -483,6 +483,32 @@ impl App {
                 });
                 let _ = req.respond(r);
             }
+            (Method::Post, "/api/gc") | (Method::Post, "/api/rebalance") => {
+                let dry_run = match read_json(&mut req) {
+                    Ok(v) => v.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+                    Err(resp) => {
+                        let _ = req.respond(resp);
+                        return;
+                    }
+                };
+                let gc = path == "/api/gc";
+                let (kind, label) = match (gc, dry_run) {
+                    (true, true) => ("gc-check", "Ricerca dei frammenti orfani"),
+                    (true, false) => ("gc", "Pulizia dei frammenti orfani"),
+                    (false, true) => ("rebalance-check", "Simulazione del ribilanciamento"),
+                    (false, false) => ("rebalance", "Ribilanciamento"),
+                };
+                let r = self.start_job(kind, label.into(), move |repo, progress| {
+                    repo.lock()?;
+                    let msg = if gc {
+                        repo.gc(dry_run, &mut |d, t| progress(d, t))?.summary(dry_run)
+                    } else {
+                        repo.rebalance(dry_run, &mut |d, t| progress(d, t))?.summary(dry_run)
+                    };
+                    Ok((msg, None))
+                });
+                let _ = req.respond(r);
+            }
             (Method::Post, "/api/unlock") => {
                 let all = match read_json(&mut req) {
                     Ok(v) => v.get("all").and_then(Value::as_bool).unwrap_or(false),

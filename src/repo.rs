@@ -87,6 +87,96 @@ pub struct ScrubReport {
     pub lost_files: Vec<String>,
 }
 
+/// Byte in forma leggibile (KiB, MiB, ...).
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Risultato della pulizia dei frammenti orfani.
+#[derive(Default, Debug, Clone)]
+pub struct GcReport {
+    /// Oggetti trovati nelle cartelle dei dati, su tutti i backend controllati.
+    pub scanned: u64,
+    /// Oggetti che l'indice non usa: frammenti di scritture interrotte, copie rimaste dopo una
+    /// riparazione, file temporanei.
+    pub orphans: u64,
+    pub orphan_bytes: u64,
+    pub deleted: u64,
+    pub failed: u64,
+    /// Backend non raggiungibili: i loro orfani restano per la prossima volta.
+    pub skipped: Vec<String>,
+}
+
+/// Risultato del ribilanciamento.
+#[derive(Default, Debug, Clone)]
+pub struct RebalanceReport {
+    /// Spostamenti decisi, e i byte da copiare.
+    pub planned: u64,
+    pub planned_bytes: u64,
+    pub moved: u64,
+    pub moved_bytes: u64,
+    /// Spostamenti non riusciti (frammento d'origine illeggibile o backend in errore).
+    pub failed: u64,
+    /// Byte di frammenti per backend prima e dopo (dopo = previsto, in simulazione).
+    pub before: Vec<(String, u64)>,
+    pub after: Vec<(String, u64)>,
+}
+
+impl GcReport {
+    pub fn summary(&self, dry_run: bool) -> String {
+        let mut msg = if self.orphans == 0 {
+            format!("Nessun frammento orfano su {} oggetti controllati", self.scanned)
+        } else if dry_run {
+            format!("{} frammenti orfani ({}) su {} oggetti: nessuno cancellato (simulazione)", self.orphans, human(self.orphan_bytes), self.scanned)
+        } else {
+            format!("{} frammenti orfani cancellati, {} liberati", self.deleted, human(self.orphan_bytes))
+        };
+        if self.failed > 0 {
+            msg += &format!("; {} non cancellati", self.failed);
+        }
+        if !self.skipped.is_empty() {
+            msg += &format!("; backend non controllati: {}", self.skipped.join(", "));
+        }
+        msg
+    }
+}
+
+impl RebalanceReport {
+    pub fn summary(&self, dry_run: bool) -> String {
+        let mut msg = if self.planned == 0 {
+            "Frammenti già distribuiti in modo equilibrato: niente da spostare".to_string()
+        } else if dry_run {
+            format!("{} frammenti da spostare ({}): nessuno spostato (simulazione)", self.planned, human(self.planned_bytes))
+        } else {
+            format!("{} frammenti spostati ({})", self.moved, human(self.moved_bytes))
+        };
+        if self.failed > 0 {
+            msg += &format!("; {} non spostati (serve una verifica con riparazione)", self.failed);
+        }
+        msg
+    }
+}
+
+/// Uno spostamento deciso dal ribilanciamento: il frammento `shard` del blocco `id` da `from` a `to`.
+struct Move {
+    id: String,
+    shard: usize,
+    from: usize,
+    to: usize,
+    len: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
     pub name: String,
@@ -977,6 +1067,205 @@ impl Repo {
             files.push(format!("{path}/"));
         }
         Ok(files)
+    }
+
+    /// Prepara pulizia e ribilanciamento: servono il lock (nessun altro processo sta scrivendo
+    /// frammenti non ancora nell'indice) e un indice senza modifiche in sospeso.
+    fn need_exclusive(&self, what: &str) -> Result<()> {
+        if !self.holds_lock() {
+            bail!("{what}: serve il lock del repository");
+        }
+        if self.dirty {
+            bail!("{what}: ci sono modifiche all'indice non salvate");
+        }
+        Ok(())
+    }
+
+    /// Cancella dai backend gli oggetti in `data/` che l'indice non usa: frammenti di scritture
+    /// interrotte, vecchie copie rimaste su un backend tornato dopo una riparazione, file
+    /// temporanei. Con `dry_run` conta soltanto. Va chiamata tenendo il lock.
+    pub fn gc(&mut self, dry_run: bool, progress: &mut dyn FnMut(u64, u64)) -> Result<GcReport> {
+        self.need_exclusive("pulizia")?;
+        let used: HashSet<(String, String)> = self
+            .index
+            .chunks
+            .iter()
+            .flat_map(|(id, c)| c.shards.iter().enumerate().map(move |(i, loc)| (loc.backend.clone(), shard_key(id, i))))
+            .collect();
+        let mut report = GcReport::default();
+        let listed = parallel(&self.backends, |b| if b.is_available() { Some(b.list_all("data")) } else { None });
+        let mut orphans: Vec<(usize, Vec<String>)> = Vec::new();
+        for (bi, res) in listed.into_iter().enumerate() {
+            let name = self.backends[bi].name().to_string();
+            let objects = match res {
+                Some(Ok(objects)) => objects,
+                Some(Err(e)) => {
+                    eprintln!("attenzione: {e:#}");
+                    report.skipped.push(name);
+                    continue;
+                }
+                None => {
+                    report.skipped.push(name);
+                    continue;
+                }
+            };
+            report.scanned += objects.len() as u64;
+            let mut mine = Vec::new();
+            for (key, size) in objects {
+                if !used.contains(&(name.clone(), key.clone())) {
+                    report.orphans += 1;
+                    report.orphan_bytes += size;
+                    mine.push(key);
+                }
+            }
+            if !mine.is_empty() {
+                orphans.push((bi, mine));
+            }
+        }
+        if dry_run || report.orphans == 0 {
+            return Ok(report);
+        }
+        // a lotti, in parallelo; l'avanzamento fra un lotto e l'altro
+        let all: Vec<(usize, String)> =
+            orphans.into_iter().flat_map(|(bi, keys)| keys.into_iter().map(move |k| (bi, k))).collect();
+        let batch_size = (self.cfg.transfers * self.backends.len()).max(1);
+        for batch in all.chunks(batch_size) {
+            for res in parallel(batch, |(bi, key)| self.backends[*bi].delete(key)) {
+                match res {
+                    Ok(()) => report.deleted += 1,
+                    Err(e) => {
+                        eprintln!("attenzione: {e:#}");
+                        report.failed += 1;
+                    }
+                }
+            }
+            progress(report.deleted + report.failed, report.orphans);
+            self.refresh_lock();
+        }
+        self.refresh_lock();
+        Ok(report)
+    }
+
+    /// Byte di frammenti per backend secondo l'indice.
+    fn shard_load(&self) -> HashMap<String, u64> {
+        let mut load: HashMap<String, u64> = self.backends.iter().map(|b| (b.name().to_string(), 0)).collect();
+        for c in self.index.chunks.values() {
+            for loc in &c.shards {
+                *load.entry(loc.backend.clone()).or_insert(0) += c.shard_len;
+            }
+        }
+        load
+    }
+
+    /// Decide gli spostamenti: da un backend sopra la media al più scarico fra quelli sotto la media che
+    /// non hanno già un frammento dello stesso blocco, solo se lo squilibrio diminuisce davvero.
+    fn plan_rebalance(&self) -> (Vec<Move>, HashMap<String, u64>) {
+        let mut load = self.shard_load();
+        let avail = self.available();
+        let names: Vec<String> = self.backends.iter().map(|b| b.name().to_string()).collect();
+        let pos: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        if avail.len() < 2 {
+            return (Vec::new(), load);
+        }
+        let total: u64 = avail.iter().map(|&i| load[&names[i]]).sum();
+        let target = total / avail.len() as u64;
+        // ruoli fissati all'inizio: chi è sopra la media cede soltanto, chi è sotto riceve soltanto.
+        // Così nessun byte fa giri inutili (un backend che cede troppo non si fa ridare frammenti).
+        // Uno scarto entro il 5% della media non vale il traffico: ripetere il comando non sposta niente
+        let tolerance = target / 20;
+        let donors: Vec<usize> = avail.iter().copied().filter(|&b| load[&names[b]] > target + tolerance).collect();
+        let receivers: Vec<usize> =
+            avail.iter().copied().filter(|&b| load[&names[b]] + tolerance < target).collect();
+        let mut moves = Vec::new();
+        for (id, c) in &self.index.chunks {
+            let mut holders: HashSet<usize> = c.shards.iter().filter_map(|l| pos.get(l.backend.as_str()).copied()).collect();
+            for (i, loc) in c.shards.iter().enumerate() {
+                let Some(&from) = pos.get(loc.backend.as_str()) else { continue };
+                if !avail.contains(&from) || load[&names[from]] <= target {
+                    continue;
+                }
+                if !donors.contains(&from) {
+                    continue;
+                }
+                let best = receivers.iter().copied().filter(|b| !holders.contains(b)).min_by_key(|&b| (load[&names[b]], b));
+                let Some(to) = best else { continue };
+                if load[&names[to]] >= target || load[&names[to]] + c.shard_len >= load[&names[from]] {
+                    continue;
+                }
+                *load.get_mut(&names[from]).unwrap() -= c.shard_len;
+                *load.get_mut(&names[to]).unwrap() += c.shard_len;
+                holders.remove(&from);
+                holders.insert(to);
+                moves.push(Move { id: id.clone(), shard: i, from, to, len: c.shard_len });
+            }
+        }
+        (moves, load)
+    }
+
+    /// Sposta frammenti dai backend più pieni a quelli più vuoti (per esempio dopo aver aggiunto un
+    /// backend), sempre con i frammenti di un blocco su backend diversi. Ogni frammento viene
+    /// verificato prima di copiarlo; la copia vecchia si cancella solo dopo il salvataggio
+    /// dell'indice. Con `dry_run` mostra soltanto il piano. Va chiamata tenendo il lock.
+    pub fn rebalance(&mut self, dry_run: bool, progress: &mut dyn FnMut(u64, u64)) -> Result<RebalanceReport> {
+        self.need_exclusive("ribilanciamento")?;
+        let sorted = |m: HashMap<String, u64>| {
+            let mut v: Vec<(String, u64)> = m.into_iter().collect();
+            v.sort();
+            v
+        };
+        let before = sorted(self.shard_load());
+        let (moves, planned_load) = self.plan_rebalance();
+        let mut report = RebalanceReport {
+            planned: moves.len() as u64,
+            planned_bytes: moves.iter().map(|m| m.len).sum(),
+            before,
+            after: sorted(planned_load),
+            ..Default::default()
+        };
+        if dry_run || moves.is_empty() {
+            return Ok(report);
+        }
+        let total = moves.len() as u64;
+        let mut since_save = 0;
+        for batch in moves.chunks(self.cfg.transfers.max(1)) {
+            let results = parallel(batch, |mv| -> Result<()> {
+                let entry = &self.index.chunks[&mv.id];
+                let key = shard_key(&mv.id, mv.shard);
+                match self.fetch_shard(&entry.shards[mv.shard], &key) {
+                    Shard::Ok(data) => self.backends[mv.to].put(&key, &data),
+                    _ => bail!("frammento {key} illeggibile su {}: lancia scrub --repair", self.backends[mv.from].name()),
+                }
+            });
+            for (mv, res) in batch.iter().zip(results) {
+                match res {
+                    Ok(()) => {
+                        let to = self.backends[mv.to].name().to_string();
+                        let from = self.backends[mv.from].name().to_string();
+                        let key = shard_key(&mv.id, mv.shard);
+                        self.index.chunks.get_mut(&mv.id).expect("blocco presente").shards[mv.shard].backend = to;
+                        self.pending_deletes.push((from, key));
+                        self.dirty = true;
+                        report.moved += 1;
+                        report.moved_bytes += mv.len;
+                        since_save += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("attenzione: {e:#}");
+                        report.failed += 1;
+                    }
+                }
+            }
+            progress(report.moved + report.failed, total);
+            // ogni tanto si salva: un'interruzione perde poco lavoro e le copie vecchie si cancellano
+            if since_save >= 64 {
+                self.save()?;
+                since_save = 0;
+            }
+            self.refresh_lock();
+        }
+        self.save()?;
+        report.after = sorted(self.shard_load());
+        Ok(report)
     }
 
     pub fn status(&self) -> Vec<BackendStatus> {

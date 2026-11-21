@@ -8,7 +8,7 @@ Con lo schema predefinito **4 + 2** ogni blocco di dati diventa 4 frammenti di d
 ognuno su un backend diverso: si possono perdere **due backend qualsiasi** senza perdere niente,
 occupando 1,5 volte lo spazio dei dati.
 
-> **Stato: fase 2 + interfaccia web + mount in lettura e scrittura (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
+> **Stato: fasi 1-4 complete: interfaccia web, mount in lettura e scrittura, pulizia e ribilanciamento (prototipo).** Funziona e ha i test, ma è codice giovane: non usarlo come unica copia
 > di dati importanti.
 
 ## Come funziona
@@ -50,7 +50,8 @@ smontato) si tratta come un disco guasto.
 **Aggiungere un backend** a un repository esistente: aggiungi la sezione `[[backend]]` alla configurazione, crea a mano
 la cartella del repository (`mkdir` oppure `rclone mkdir nuovoaccount:cloudraid`) e riavvia i servizi. Alla prima
 scrittura il backend nuovo riceve l'indice e la chiave cifrata del repository (`cloudraid.key`), e da lì in poi i
-frammenti nuovi si distribuiscono anche su di lui; quelli già scritti restano dove sono (ribilanciamento: fase 4).
+frammenti nuovi si distribuiscono anche su di lui; per spostarci anche una parte di quelli già scritti usa
+`cloudraid rebalance` (vedi sotto).
 Se la cartella contiene già la chiave di un **altro** repository, cloudraid non la tocca e avvisa.
 
 ## Interfaccia web
@@ -178,6 +179,8 @@ cloudraid status                   # backend disponibili, frammenti per backend
 cloudraid scrub                    # verifica tutti i frammenti
 cloudraid scrub --repair           # e ricostruisce quelli mancanti o danneggiati
 cloudraid unlock                   # cancella i lock scaduti di processi interrotti
+cloudraid gc --dry-run             # conta i frammenti orfani; senza --dry-run li cancella
+cloudraid rebalance --dry-run      # piano di ribilanciamento; senza --dry-run sposta i frammenti
 cloudraid mount /mnt/cloudraid --rw  # il repository come cartella (vedi sopra)
 ```
 
@@ -186,6 +189,19 @@ o uno `scrub --repair` stanno cancellando o spostando frammenti.
 
 La password si può passare anche con la variabile `CLOUDRAID_PASSWORD` (utile negli script).
 **Senza password i dati non si recuperano in nessun modo**: salvala nel password manager.
+
+### Pulizia e ribilanciamento
+
+- `cloudraid gc` elenca tutti gli oggetti nelle cartelle `data/` dei backend (su rclone con una sola chiamata
+  ricorsiva) e cancella quelli che l'indice non usa: frammenti di caricamenti interrotti, file temporanei, copie
+  vecchie rimaste su un backend tornato disponibile dopo una riparazione. Prende il lock, così nessun altro
+  processo sta caricando frammenti non ancora nell'indice. I backend non raggiungibili vengono saltati.
+- `cloudraid rebalance` sposta frammenti dai backend sopra la media a quelli più vuoti, per esempio dopo averne
+  aggiunto uno. I frammenti di un blocco restano sempre su backend diversi, e uno spostamento si fa solo se riduce
+  davvero lo squilibrio. Ogni frammento viene verificato prima di copiarlo; la copia vecchia si cancella solo dopo il
+  salvataggio dell'indice, che avviene ogni 64 spostamenti, così un'interruzione perde poco lavoro e lascia solo
+  orfani innocui. Con i cloud costa traffico: prima guarda il piano con `--dry-run`.
+- Tutte e due sono anche nell'interfaccia web (Manutenzione), con simulazione, conferma e avanzamento.
 
 ### Quando un backend si guasta
 
@@ -214,7 +230,7 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
   piccoli (5 MB) in 12 s con `cp -r` o `rsync -a`, circa 18 ms a file (la scrittura dei frammenti con fsync).
   Con backend cloud ogni file costa almeno un giro di rete sul backend più lento.
 - Se una scrittura si interrompe a metà possono restare frammenti orfani (innocui, occupano spazio):
-  la pulizia arriverà con la fase 4.
+  `cloudraid gc` li cancella.
 - Il lock non è atomico (nessun backend lo permette in modo uniforme): due processi avviati nello stesso
   istante se ne accorgono rileggendo i lock, ma è una protezione dagli errori, non una garanzia assoluta.
 - Un backend lento rallenta tutto: le letture aspettano i frammenti di dati anche se la parità su un backend veloce
@@ -234,4 +250,4 @@ data/ab/abcd…ef.0 … .5         frammenti: <id del blocco>.<numero del framme
 | 2b | Letture "a gara": chiedere anche la parità e usare i primi k frammenti che arrivano, così un backend lento non blocca | |
 | 3 | Mount FUSE in sola lettura con cache in memoria, servizio `mount` nel compose | fatta |
 | 4a | Mount in scrittura (copia locale caricata alla chiusura), rinomine e cartelle nell'indice | fatta |
-| 4 | Pulizia dei frammenti orfani, ribilanciamento | |
+| 4 | Pulizia dei frammenti orfani (`gc`) e ribilanciamento (`rebalance`), da riga di comando e interfaccia web | fatta |

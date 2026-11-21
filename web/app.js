@@ -501,6 +501,11 @@ document.addEventListener('drop', (e) => {
 // ---------------------------------------------------------------------------------------------
 // Manutenzione
 
+/** Che cosa conta l'avanzamento di un'operazione. */
+function jobUnit(kind) {
+  return { gc: 'frammenti', rebalance: 'spostamenti' }[kind] || 'blocchi';
+}
+
 function reportBlock(j) {
   const r = j.report;
   if (!r) return '';
@@ -526,10 +531,14 @@ function renderMaintenance(st) {
     <div class="card job">
       <div class="job-head"><h3>${esc(job.label)}</h3><span class="pill run">in corso da ${duration(job.started, st.now)}</span></div>
       <div class="bar lg ${job.total ? '' : 'indet'}"><div data-w="${pct}"></div></div>
-      <span class="muted">${job.total ? `${num(job.done)} blocchi su ${num(job.total)} (${Math.floor(pct)}%)` : 'In preparazione…'}</span>
+      <span class="muted">${job.total ? `${num(job.done)} ${jobUnit(job.kind)} su ${num(job.total)} (${Math.floor(pct)}%)` : 'In preparazione…'}</span>
     </div>` : '';
   const locks = snap ? snap.locks : [];
   const dis = st.busy ? 'disabled' : '';
+  const lastOf = (...kinds) => (st.history || []).find((j) => kinds.includes(j.kind));
+  const lastLine = (j, none) => (j
+    ? `<p class="note"><span class="pill ${j.state === 'ok' ? 'ok' : 'bad'}">${when(j.finished)}</span> ${esc(j.label)}: ${esc(j.message)}</p>`
+    : `<p class="note">${none}</p>`);
   return `
     ${current}
     <div class="grid-2">
@@ -547,6 +556,28 @@ function renderMaintenance(st) {
         <p class="muted">Verifica di nuovo quali backend sono raggiungibili e rilegge l'indice più recente, per esempio dopo aver
           sostituito un account o usato la riga di comando.</p>
         <div class="card-actions"><button class="btn" data-action="refresh-backends" ${dis}>${ICON.refresh} Ricontrolla</button></div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Pulizia dei frammenti orfani</h3>
+        <p class="muted">Cerca sui backend i frammenti che l'indice non usa più: avanzi di caricamenti interrotti, copie
+          vecchie rimaste su un backend tornato dopo una riparazione. Cancellarli libera spazio e non tocca i file.</p>
+        ${lastLine(lastOf('gc', 'gc-check'), 'Nessuna pulizia eseguita da questa interfaccia.')}
+        <div class="card-actions">
+          <button class="btn" data-action="gc-check" ${dis}>Controlla</button>
+          <button class="btn btn-primary" data-action="gc" ${dis}>Pulisci</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Ribilanciamento</h3>
+        <p class="muted">Sposta frammenti dai backend più pieni a quelli più vuoti, per esempio dopo aver aggiunto un
+          backend: i blocchi già scritti restano dove sono finché non li sposti. Ogni frammento viene verificato prima della copia.</p>
+        ${lastLine(lastOf('rebalance', 'rebalance-check'), 'Nessun ribilanciamento eseguito da questa interfaccia.')}
+        <div class="card-actions">
+          <button class="btn" data-action="rebalance-check" ${dis}>Simula</button>
+          <button class="btn btn-primary" data-action="rebalance" ${dis}>Ribilancia</button>
+        </div>
       </div>
     </div>
     <div class="card">
@@ -610,6 +641,20 @@ document.addEventListener('click', async (ev) => {
       return startJob('api/scrub', { repair: false }, 'Verifica avviata');
     case 'repair':
       return startJob('api/scrub', { repair: true }, 'Verifica e riparazione avviate');
+    case 'gc-check':
+      return startJob('api/gc', { dry_run: true }, 'Ricerca dei frammenti orfani avviata');
+    case 'gc':
+      if (await confirmDialog('Cancellare i frammenti orfani?', 'Vengono cancellati dai backend solo i frammenti che l\'indice non usa. Durante la pulizia il repository è bloccato per le altre scritture (anche quelle dalla cartella montata).', 'Pulisci', false)) {
+        return startJob('api/gc', { dry_run: false }, 'Pulizia avviata');
+      }
+      return undefined;
+    case 'rebalance-check':
+      return startJob('api/rebalance', { dry_run: true }, 'Simulazione avviata');
+    case 'rebalance':
+      if (await confirmDialog('Ribilanciare i frammenti?', 'I frammenti vengono copiati sui backend più vuoti e poi cancellati da quelli più pieni: con i cloud può richiedere molto tempo e traffico. Durante il lavoro il repository è bloccato per le altre scritture.', 'Ribilancia', false)) {
+        return startJob('api/rebalance', { dry_run: false }, 'Ribilanciamento avviato');
+      }
+      return undefined;
     case 'unlock':
       return startJob('api/unlock', { all: false });
     case 'unlock-all':

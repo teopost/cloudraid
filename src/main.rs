@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use cloudraid::repo::LOCK_STALE_SECS;
+use cloudraid::repo::{human, LOCK_STALE_SECS};
 use cloudraid::{Config, ReadStats, Repo};
 
 #[derive(Parser)]
@@ -90,6 +90,18 @@ enum Cmd {
         #[arg(long)]
         staging: Option<PathBuf>,
     },
+    /// Cancella i frammenti orfani (scritture interrotte, copie vecchie dopo una riparazione)
+    Gc {
+        /// Conta soltanto, senza cancellare
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Sposta frammenti dai backend più pieni ai più vuoti (per esempio dopo averne aggiunto uno)
+    Rebalance {
+        /// Mostra il piano, senza spostare niente
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Cancella i lock lasciati da processi interrotti
     Unlock {
         /// Cancella anche i lock non ancora scaduti (solo se sei sicuro che nessun processo stia lavorando)
@@ -114,20 +126,6 @@ fn password(confirm: bool) -> Result<String> {
     Ok(p)
 }
 
-fn human(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
 
 fn file_name(p: &Path) -> Result<String> {
     let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
@@ -263,7 +261,7 @@ fn run(cli: Cli) -> Result<()> {
         );
     }
     // chi modifica il repository prende il lock esclusivo
-    if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true }) {
+    if matches!(cli.cmd, Cmd::Put { .. } | Cmd::Rm { .. } | Cmd::Scrub { repair: true } | Cmd::Gc { .. } | Cmd::Rebalance { .. }) {
         repo.lock()?;
     }
     let result = match cli.cmd {
@@ -293,6 +291,18 @@ fn run(cli: Cli) -> Result<()> {
             cmd_status(&repo, &cfg);
             Ok(())
         }
+        Cmd::Gc { dry_run } => repo.gc(dry_run, &mut |_, _| {}).map(|r| {
+            println!("{}", r.summary(dry_run));
+        }),
+        Cmd::Rebalance { dry_run } => repo.rebalance(dry_run, &mut |d, t| eprint!("\r{d}/{t} spostamenti")).map(|r| {
+            if r.planned > 0 && !dry_run {
+                eprintln!();
+            }
+            println!("{}", r.summary(dry_run));
+            for ((name, before), (_, after)) in r.before.iter().zip(&r.after) {
+                println!("  {name:<12} {:>10} -> {:>10}", human(*before), human(*after));
+            }
+        }),
         Cmd::Unlock { all } => {
             let removed = repo.break_locks(all);
             for l in &removed {

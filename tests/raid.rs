@@ -597,3 +597,132 @@ fn rinomina_cartelle_e_date_senza_spostare_dati() {
     assert!(!repo.is_dir("spostata"));
     repo.save().unwrap();
 }
+
+/// Byte di frammenti per backend secondo l'indice.
+fn loads(repo: &Repo, n: usize) -> Vec<u64> {
+    let mut out = vec![0u64; n];
+    for c in repo.index().chunks.values() {
+        for loc in &c.shards {
+            out[loc.backend.trim_start_matches("acc").parse::<usize>().unwrap()] += c.shard_len;
+        }
+    }
+    out
+}
+
+#[test]
+fn pulizia_dei_frammenti_orfani() {
+    let lab = Lab::new(6, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    // senza lock la pulizia non parte: un altro processo potrebbe star caricando
+    assert!(repo.gc(true, &mut |_, _| {}).is_err());
+
+    // tre tipi di orfani: frammento di un caricamento interrotto, file temporaneo,
+    // copia di un frammento rimasta su un backend che non dovrebbe averlo
+    let (id, chunk) = repo.index().chunks.iter().next().map(|(i, c)| (i.clone(), c.clone())).unwrap();
+    let orphan = lab.backend_dir(0).join("data/zz/zz00interrotto.3");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, b"frammento mai finito nell'indice").unwrap();
+    let tmp = lab.backend_dir(1).join(format!("data/{}/{id}.0.ab12cd34.tmp", &id[..2]));
+    fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    fs::write(&tmp, b"scrittura interrotta").unwrap();
+    // con 6 backend e 4+2 frammenti ogni backend ha un frammento di ogni blocco: il frammento 0
+    // copiato su un altro backend (che per l'indice ha un altro frammento) è un orfano
+    let holder = chunk.shards[0].backend.trim_start_matches("acc").parse::<usize>().unwrap();
+    let key = format!("data/{}/{id}.0", &id[..2]);
+    let copy = lab.backend_dir((holder + 1) % 6).join(&key);
+    fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    fs::copy(lab.backend_dir(holder).join(&key), &copy).unwrap();
+
+    repo.lock().unwrap();
+    let dry = repo.gc(true, &mut |_, _| {}).unwrap();
+    assert_eq!(dry.orphans, 3, "{dry:?}");
+    assert_eq!(dry.deleted, 0);
+    assert!(orphan.exists() && tmp.exists() && copy.exists(), "la simulazione non cancella");
+    let mut progress = Vec::new();
+    let r = repo.gc(false, &mut |d, t| progress.push((d, t))).unwrap();
+    assert_eq!((r.orphans, r.deleted, r.failed), (3, 3, 0));
+    assert_eq!(progress.last(), Some(&(3, 3)));
+    assert!(!orphan.exists() && !tmp.exists() && !copy.exists());
+    assert_eq!(repo.gc(true, &mut |_, _| {}).unwrap().orphans, 0);
+    // i file sono intatti
+    check_all(&lab, &repo, &samples);
+    let s = repo.scrub(false).unwrap();
+    assert_eq!((s.shards_missing, s.shards_corrupt), (0, 0));
+}
+
+#[test]
+fn ribilanciamento_dopo_un_backend_aggiunto() {
+    let mut lab = Lab::new(6, 4, 2);
+    let mut repo = lab.init();
+    let samples = load_samples(&lab, &mut repo);
+    drop(repo);
+    // due account nuovi, vuoti
+    for i in 6..8 {
+        let path = lab.tmp.path().join(format!("acc{i}"));
+        fs::create_dir_all(&path).unwrap();
+        lab.cfg.backends.push(BackendConfig { name: format!("acc{i}"), kind: BackendKind::Local { path } });
+    }
+    let mut repo = lab.open();
+    repo.lock().unwrap();
+    let before = loads(&repo, 8);
+    assert_eq!((before[6], before[7]), (0, 0));
+
+    let plan = repo.rebalance(true, &mut |_, _| {}).unwrap();
+    assert!(plan.planned > 0);
+    assert_eq!((lab.shards_on(6), lab.shards_on(7)), (0, 0), "la simulazione non sposta");
+    assert_eq!(loads(&repo, 8), before);
+
+    // si copia solo quello che serve a riempire i backend nuovi, niente giri fra quelli vecchi
+    let filled: u64 = plan.after.iter().filter(|(n, _)| n == "acc6" || n == "acc7").map(|(_, b)| *b).sum();
+    assert_eq!(plan.planned_bytes, filled, "{plan:?}");
+    let r = repo.rebalance(false, &mut |_, _| {}).unwrap();
+    assert_eq!((r.moved, r.failed, r.moved_bytes), (plan.planned, 0, plan.planned_bytes));
+    let after = loads(&repo, 8);
+    let spread = |v: &[u64]| v.iter().max().unwrap() - v.iter().min().unwrap();
+    let biggest = repo.index().chunks.values().map(|c| c.shard_len).max().unwrap();
+    assert!(spread(&after) <= 2 * biggest, "equilibrato: {after:?}");
+    assert!(lab.shards_on(6) > 0 && lab.shards_on(7) > 0);
+    // ogni blocco ha ancora i frammenti su backend tutti diversi
+    for c in repo.index().chunks.values() {
+        let set: std::collections::HashSet<&str> = c.shards.iter().map(|l| l.backend.as_str()).collect();
+        assert_eq!(set.len(), c.shards.len());
+    }
+    // le copie vecchie sono state cancellate: niente orfani, tutto integro e leggibile
+    assert_eq!(repo.gc(true, &mut |_, _| {}).unwrap().orphans, 0);
+    let total: usize = (0..8).map(|i| lab.shards_on(i)).sum();
+    assert_eq!(total, repo.index().chunks.values().map(|c| c.shards.len()).sum::<usize>());
+    drop(repo);
+    let mut repo = lab.open();
+    check_all(&lab, &repo, &samples);
+    let s = repo.scrub(false).unwrap();
+    assert_eq!((s.shards_missing, s.shards_corrupt), (0, 0));
+    // una seconda volta non c'è niente da fare
+    repo.lock().unwrap();
+    assert_eq!(repo.rebalance(true, &mut |_, _| {}).unwrap().planned, 0, "già equilibrato");
+    // e si possono perdere ancora due backend qualsiasi, anche fra i nuovi
+    drop(repo);
+    lab.lose(6);
+    lab.lose(2);
+    check_all(&lab, &lab.open(), &samples);
+}
+
+#[test]
+fn rclone_pulizia_con_elenco_ricorsivo() {
+    if !have_rclone() {
+        eprintln!("rclone non disponibile: test saltato");
+        return;
+    }
+    let lab = Lab::with(6, 4, 2, |i| i % 2 == 0);
+    let mut repo = lab.init();
+    load_samples(&lab, &mut repo);
+    let orphan = lab.backend_dir(0).join("data/zz/zz00orfano.1");
+    fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    fs::write(&orphan, vec![7u8; 1234]).unwrap();
+    repo.lock().unwrap();
+    let dry = repo.gc(true, &mut |_, _| {}).unwrap();
+    assert_eq!((dry.orphans, dry.orphan_bytes), (1, 1234), "{dry:?}");
+    assert_eq!(dry.scanned as usize, (0..6).map(|i| lab.shards_on(i)).sum::<usize>());
+    assert_eq!(repo.gc(false, &mut |_, _| {}).unwrap().deleted, 1);
+    assert!(!orphan.exists());
+}

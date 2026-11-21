@@ -292,6 +292,14 @@ fn modifiche_dalla_riga_di_comando_non_vanno_perse() {
     assert_eq!(files, ["dal-web-1.bin", "dal-web-2.bin", "dalla-cli.bin"]);
     assert_eq!(status(&lab, &cookie)["snapshot"]["dirs"], serde_json::json!(["vuota/dentro"]));
 
+    // pulizia e ribilanciamento dall'interfaccia (qui non c'è niente da fare)
+    let j = run_job(&lab, &cookie, "POST", "api/gc", Some(br#"{"dry_run":true}"#));
+    assert_eq!((j["state"].as_str(), j["kind"].as_str()), (Some("ok"), Some("gc-check")), "{j}");
+    assert!(j["message"].as_str().unwrap().starts_with("Nessun frammento orfano"), "{j}");
+    let j = run_job(&lab, &cookie, "POST", "api/rebalance", Some(br#"{"dry_run":false}"#));
+    assert_eq!(j["state"], "ok", "{j}");
+    assert!(j["message"].as_str().unwrap().contains("niente da spostare"), "{j}");
+
     // e la riga di comando vede tutto
     let cli = Repo::open(lab.cfg.clone(), PW).unwrap();
     assert_eq!(cli.index().files.len(), 3);

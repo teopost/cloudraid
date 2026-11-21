@@ -33,6 +33,9 @@ pub trait Backend: Send + Sync {
     fn delete(&self, key: &str) -> Result<()>;
     /// Chiavi contenute in una "cartella" (non ricorsivo), nella forma `dir/nome`.
     fn list(&self, dir: &str) -> Result<Vec<String>>;
+    /// Tutti gli oggetti sotto `dir`, anche nelle sottocartelle, con la dimensione in byte.
+    /// Comprende gli avanzi di scritture interrotte (file temporanei): servono alla pulizia.
+    fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>>;
     /// Tipo di backend, per l'interfaccia ("local", "rclone").
     fn kind(&self) -> &'static str;
     /// Dimentica la disponibilità memorizzata: alla prossima domanda si verifica di nuovo.
@@ -164,6 +167,25 @@ impl Backend for Local {
             }
         }
         Ok(keys)
+    }
+
+    fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>> {
+        let base = self.path(dir)?;
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(&base) {
+            let entry = entry.with_context(|| format!("backend {}: elenco di {dir}", self.name))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel = entry.path().strip_prefix(&self.root).expect("sotto la radice");
+            if let Some(key) = rel.to_str() {
+                out.push((key.to_string(), entry.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -435,6 +457,28 @@ impl Backend for Rclone {
             .iter()
             .filter(|it| !it.get("IsDir").and_then(Value::as_bool).unwrap_or(false))
             .filter_map(|it| it.get("Path").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+
+    fn list_all(&self, dir: &str) -> Result<Vec<(String, u64)>> {
+        check_key(dir)?;
+        self.ensure_available()?;
+        // una sola chiamata per tutto l'albero, invece di una per sottocartella
+        let Some(v) = self.retry(&format!("elenco completo di {dir}"), || {
+            self.daemon.call("operations/list", &json!({"fs": self.remote, "remote": dir, "opt": {"recurse": true}}))
+        })?
+        else {
+            return Ok(Vec::new());
+        };
+        let items = v.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(items
+            .iter()
+            .filter(|it| !it.get("IsDir").and_then(Value::as_bool).unwrap_or(false))
+            .filter_map(|it| {
+                let path = it.get("Path").and_then(Value::as_str)?.to_string();
+                let size = it.get("Size").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+                Some((path, size))
+            })
             .collect())
     }
 }
