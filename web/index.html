@@ -41,6 +41,7 @@
           <a href="#attivita" data-view="attivita">Attività</a>
         </nav>
         <div class="topbar-right">
+          <button id="health-badge" class="health-badge" type="button" data-action="health-open" hidden aria-haspopup="dialog"></button>
           <span id="busy" class="busy" hidden><span class="spinner" aria-hidden="true"></span><span id="busy-label"></span></span>
           <button id="logout" class="btn btn-ghost btn-sm" type="button">Esci</button>
         </div>
@@ -55,6 +56,12 @@
       <section id="view-attivita" class="view" hidden></section>
     </main>
   </div>
+
+  <dialog id="health-dialog" class="dialog dialog-wide" aria-labelledby="health-title">
+    <h3 id="health-title">Stato</h3>
+    <div id="health-body"></div>
+    <div class="dialog-actions"><button type="button" class="btn btn-primary" data-action="health-close">Chiudi</button></div>
+  </dialog>
 
   <dialog id="confirm" class="dialog">
     <form method="dialog">

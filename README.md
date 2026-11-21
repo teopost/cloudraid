@@ -85,6 +85,8 @@ dal tuo account, e metti i valori in Spazi → "Collegamento con Google, Microso
 - **Google Drive**: console.cloud.google.com → nuovo progetto → abilita *Google Drive API* → **Google Auth Platform**:
   - Inizia: app `cloudraid`, pubblico *Esterno*;
   - Accesso ai dati: ambito `.../auth/drive.file`;
+  - Branding: home page e norme sulla privacy, due pagine pubbliche vere su un tuo dominio, più quel dominio tra i
+    domini autorizzati (senza, "Pubblica app" resta grigio);
   - Pubblico: **Pubblica app** (con il solo drive.file non serve la verifica, e i collegamenti non scadono dopo 7 giorni
     come in modalità test);
   - Client: Crea client di tipo **TV e dispositivi con input limitato**.

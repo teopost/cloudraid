@@ -344,3 +344,21 @@ td.msg { max-width: 420px; }
 .bar > div.bad { background: var(--bad); }
 .warn-text { color: var(--warn); }
 .bar.unknown { background: repeating-linear-gradient(45deg, var(--surface-2), var(--surface-2) 6px, var(--border) 6px, var(--border) 8px); }
+.backend-meta { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; margin-top: -.2rem; }
+
+/* stato: badge nella barra e righe compatte in panoramica */
+.health-badge { display: inline-flex; align-items: center; gap: .4rem; border: 1px solid transparent; border-radius: 99px; padding: .3rem .75rem .3rem .55rem; font: inherit; font-size: .85rem; font-weight: 650; cursor: pointer; }
+.health-badge svg { width: 16px; height: 16px; flex: none; }
+.health-badge.ok { background: var(--ok-soft); color: var(--ok); }
+.health-badge.warn { background: var(--warn-soft); color: var(--warn); }
+.health-badge.bad { background: var(--bad-soft); color: var(--bad); }
+.health-badge:hover { border-color: currentColor; }
+#health-body { display: grid; gap: .75rem; margin: .5rem 0 0; }
+.status-strip { display: grid; gap: .5rem; }
+.strip-item { display: flex; align-items: center; gap: .6rem; width: 100%; text-align: left; border: 0; border-radius: var(--radius); padding: .6rem .9rem; font: inherit; font-size: .92rem; font-weight: 600; cursor: pointer; }
+.strip-item svg { width: 18px; height: 18px; flex: none; }
+.strip-item.warn { background: var(--warn-soft); color: var(--warn); }
+.strip-item.bad { background: var(--bad-soft); color: var(--bad); }
+.strip-item .strip-more { margin-left: auto; font-weight: 500; opacity: .8; text-decoration: underline; }
+details.why summary { cursor: pointer; }
+details.why p { margin-top: .4rem; }

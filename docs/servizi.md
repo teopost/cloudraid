@@ -323,9 +323,22 @@ personale "da solo": l'app deve stare in una directory (tenant) Microsoft Entra
       Accetta le norme e premi **Crea**.
    4. **Accesso ai dati** (*Data Access*) → **Aggiungi o rimuovi ambiti**: cerca `drive.file`, spunta
       `.../auth/drive.file`, premi **Aggiorna** e poi **Salva** in fondo alla pagina.
-   5. **Pubblico** (*Audience*) → **Pubblica app** → conferma: lo stato diventa *In produzione*. Con il solo ambito
+   5. **Branding**: compila questi campi, poi **Salva**. Senza, il pulsante "Pubblica app" resta grigio con il messaggio
+      "sono richiesti ... un URL della home page e un URL delle norme sulla privacy".
+
+      | Campo | Valore |
+      |---|---|
+      | Home page dell'applicazione | una pagina pubblica su un tuo dominio |
+      | Link alle norme sulla privacy | una seconda pagina pubblica |
+      | Domini autorizzati | il dominio delle due pagine |
+
+      Le pagine devono essere vere e raggiungibili. Su len2 ci sono già: `https://cloudraid.stefanoteodorani.it/` e
+      `https://cloudraid.stefanoteodorani.it/privacy` (cartella `/srv/docker/cloudraid-sito`), con dominio autorizzato
+      `stefanoteodorani.it`. Se Google chiede di verificare la proprietà del dominio, si fa in Search Console con un record
+      TXT nel DNS.
+   6. **Pubblico** (*Audience*) → **Pubblica app** → conferma: lo stato diventa *In produzione*. Con il solo ambito
       `drive.file` non serve la verifica di Google. In modalità test, invece, i collegamenti scadono dopo 7 giorni.
-   6. **Client** (*Clients*) → **Crea client**:
+   7. **Client** (*Clients*) → **Crea client**:
       - tipo di applicazione **TV e dispositivi con input limitato**;
       - nome `cloudraid`, poi **Crea**.
 

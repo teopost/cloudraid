@@ -232,6 +232,7 @@ function render() {
   const caret = keepSearch ? active.selectionStart : 0;
   view.innerHTML = html;
   applyBars(view);
+  renderHealthBadge(st);
   if (keepSearch) {
     const s = $('#search');
     s.focus();
@@ -330,7 +331,7 @@ function renderCapacity(snap) {
   const shared = active.filter((b) => b.same_device && b.same_device.length).map((b) => b.name);
   let why = '';
   if (ideal != null && total < ideal * 0.9) {
-    why = `<p class="muted small">Con la ridondanza (${k} + ${m}, cioè ${((k + m) / k).toLocaleString('it-IT', { maximumFractionDigits: 2 })} volte) ${size(allocated)} basterebbero per circa ${size(ideal)} di file: qui sono ${size(total)} perché gli spazi piccoli si riempiono prima${shared.length ? ` e su ${shared.join(', ')}, che stanno sullo stesso disco, va al massimo ${m === 1 ? 'un pezzo' : `${m} pezzi`} per blocco` : ''}. Quando lo spazio protetto finisce, i file nuovi vengono rifiutati invece di finire in un posto meno sicuro. Un altro spazio${shared.length ? ' fuori da quel disco' : ''} aumenta la capienza.</p>`;
+    why = `<details class="why"><summary class="muted small">Perché meno dello spazio allocato?</summary><p class="muted small">Con la ridondanza (${k} + ${m}, cioè ${((k + m) / k).toLocaleString('it-IT', { maximumFractionDigits: 2 })} volte) ${size(allocated)} basterebbero per circa ${size(ideal)} di file: qui sono ${size(total)} perché gli spazi piccoli si riempiono prima${shared.length ? ` e su ${shared.join(', ')}, che stanno sullo stesso disco, va al massimo ${m === 1 ? 'un pezzo' : `${m} pezzi`} per blocco` : ''}. Quando lo spazio protetto finisce, i file nuovi vengono rifiutati invece di finire in un posto meno sicuro. Un altro spazio${shared.length ? ' fuori da quel disco' : ''} aumenta la capienza.</p></details>`;
   }
   return `<div class="card capacity-card">
     <div class="capacity-head">
@@ -347,40 +348,63 @@ function renderCapacity(snap) {
   </div>`;
 }
 
+/** Tutti i messaggi di stato: lo stato della ridondanza e gli avvisi sulla configurazione. */
+function statusItems(snap, history) {
+  return [health(snap, history), ...reliabilityNotes(snap)];
+}
+
+/** Il badge nella barra in alto: verde se va tutto bene, arancione o rosso con il numero di avvisi. */
+function renderHealthBadge(st) {
+  const badge = $('#health-badge');
+  const snap = st && st.snapshot;
+  if (!snap) {
+    badge.hidden = true;
+    return;
+  }
+  const items = statusItems(snap, st.history);
+  const worst = items.some((i) => i[0] === 'bad') ? 'bad' : items.some((i) => i[0] === 'warn') ? 'warn' : 'ok';
+  const problems = items.filter((i) => i[0] !== 'ok').length;
+  const label = worst === 'ok' ? 'Tutto ok' : worst === 'bad' ? (problems === 1 ? 'Problema' : `${problems} problemi`) : (problems === 1 ? 'Attenzione' : `${problems} avvisi`);
+  badge.className = `health-badge ${worst}`;
+  badge.innerHTML = `${ICON[worst]}<span>${label}</span>`;
+  badge.title = items.filter((i) => i[0] !== 'ok').map((i) => i[1]).join(' · ') || items[0][1];
+  badge.hidden = false;
+  if ($('#health-dialog').open) renderHealthDialog(items);
+}
+
+function renderHealthDialog(items) {
+  $('#health-body').innerHTML = items
+    .map(([k, title, text]) => `<div class="banner ${k}">${ICON[k]}<div><strong>${esc(title)}</strong><p>${esc(text)}</p></div></div>`)
+    .join('');
+}
+
 function renderOverview(st) {
   const snap = st.snapshot;
   if (!snap) return '<div class="card empty">Stato non ancora disponibile.</div>';
-  const [kind, title, text] = health(snap, st.history);
+  // i messaggi completi stanno nel badge in alto; qui solo una riga per ogni problema, niente se va tutto bene
+  const problems = statusItems(snap, st.history).filter((i) => i[0] !== 'ok');
   const used = snap.backends.reduce((a, b) => a + b.bytes, 0);
-  const notes = reliabilityNotes(snap);
   const scrub = lastScrub(st.history);
   const k = snap.data_shards;
   const m = snap.parity_shards;
   const overhead = ((k + m) / k).toLocaleString('it-IT', { maximumFractionDigits: 2 });
 
-  const dis = st.busy ? 'disabled' : '';
   const backendState = (b) => {
     if (b.retired && b.shards === 0) return ['ok', 'dismesso'];
     if (b.retired) return ['warn', 'in dismissione'];
     return b.available ? ['ok', 'disponibile'] : ['bad', 'non disponibile'];
   };
-  const backendActions = (b) => {
-    if (!b.retired) {
-      return `<div class="card-actions"><button class="btn btn-ghost btn-sm" data-action="retire" data-name="${esc(b.name)}" ${dis}>Dismetti</button></div>`;
-    }
-    const note = b.shards === 0
-      ? '<p class="note">Vuoto: ora puoi toglierlo dalla configurazione o sostituirlo.</p>'
-      : `<p class="note">Non riceve più frammenti nuovi; ne restano ${num(b.shards)} da spostare.</p>`;
-    return `${note}<div class="card-actions">
-      ${b.shards > 0 ? `<button class="btn btn-sm" data-action="retire-resume" data-name="${esc(b.name)}" ${dis}>Riprendi lo svuotamento</button>` : ''}
-      <button class="btn btn-ghost btn-sm" data-action="unretire" data-name="${esc(b.name)}" ${dis}>Rimetti in servizio</button></div>`;
+  // nelle mattonelle niente pulsanti: dismettere e rimettere in servizio si fa nella pagina Spazi
+  const backendNote = (b) => {
+    if (!b.retired) return '';
+    return b.shards === 0
+      ? '<p class="note">Dismesso e vuoto: si può togliere o sostituire dalla pagina Spazi.</p>'
+      : `<p class="note">In dismissione: ne restano ${num(b.shards)} frammenti da spostare (pagina Spazi).</p>`;
   };
   const backends = snap.backends.map((b) => `
     <div class="card backend ${b.available || (b.retired && b.shards === 0) ? '' : 'down'}">
-      <div class="backend-head">
-        <div class="backend-name"><span>${esc(b.name)}</span><span class="tag">${esc(typeLabel(b.kind))}</span></div>
-        <span class="pill ${backendState(b)[0]}">${backendState(b)[1]}</span>
-      </div>
+      <div class="backend-name"><span>${esc(b.name)}</span></div>
+      <div class="backend-meta"><span class="tag">${esc(typeLabel(b.kind))}</span><span class="pill ${backendState(b)[0]}">${backendState(b)[1]}</span></div>
       <div class="backend-loc" title="${esc(b.location)}">${esc(b.location)}</div>
       ${(() => {
         const s = spaceOf(b);
@@ -394,7 +418,7 @@ function renderOverview(st) {
           <div class="muted small">${num(b.shards)} frammenti · ${s.allocated ? `spazio allocato ${size(b.limit)}` : 'tutto lo spazio libero del servizio'}</div>`;
       })()}
       ${b.latency_ms != null ? `<div class="muted small">lettura di un frammento: ${b.latency_ms < 1000 ? `${Math.round(b.latency_ms)} ms` : `${(b.latency_ms / 1000).toFixed(1)} s`}</div>` : ''}
-      ${backendActions(b)}
+      ${backendNote(b)}
     </div>`).join('');
 
   const locks = snap.locks.length ? `
@@ -405,8 +429,7 @@ function renderOverview(st) {
     </div>` : '';
 
   return `
-    <div class="banner ${kind}">${ICON[kind]}<div><strong>${esc(title)}</strong><p>${esc(text)}</p></div></div>
-    ${notes.map(([nk, nt, nx]) => `<div class="banner ${nk}">${ICON[nk]}<div><strong>${esc(nt)}</strong><p>${esc(nx)}</p></div></div>`).join('')}
+    ${problems.length ? `<div class="status-strip">${problems.map(([pk, pt]) => `<button type="button" class="strip-item ${pk}" data-action="health-open">${ICON[pk]}<span>${esc(pt)}</span><span class="strip-more">Dettagli</span></button>`).join('')}</div>` : ''}
     ${renderCapacity(snap)}
     <div class="stats">
       <div class="card stat"><div class="label">File</div><div class="value">${num(snap.files.length)}</div><div class="sub">${num(snap.chunks)} blocchi</div></div>
@@ -1113,6 +1136,7 @@ const APP_GUIDES = [
       'In "API e servizi", "Libreria", cerca <strong>Google Drive API</strong> e premi "Abilita".',
       'Apri <strong>Google Auth Platform</strong> (menu a sinistra, oppure cerca "Google Auth Platform" in alto). Se è la prima volta premi <strong>Inizia</strong> (Get started): nome dell\'app "cloudraid", la tua email di assistenza, pubblico <strong>Esterno</strong> (External), la tua email come contatto, accetta e premi Crea.',
       'In <strong>Accesso ai dati</strong> (Data Access) premi <strong>Aggiungi o rimuovi ambiti</strong>, cerca <code>drive.file</code>, spunta <code>.../auth/drive.file</code>, premi Aggiorna e poi <strong>Salva</strong> in fondo alla pagina.',
+      'In <strong>Branding</strong> compila <strong>Home page dell\'applicazione</strong> e <strong>Link alle norme sulla privacy</strong> con due pagine pubbliche su un tuo dominio (per esempio <code>https://cloudraid.tuodominio.it/</code> e <code>.../privacy</code>), aggiungi quel dominio in <strong>Domini autorizzati</strong> e salva: senza, Google non lascia pubblicare l\'app (il pulsante resta grigio).',
       'In <strong>Pubblico</strong> (Audience) premi <strong>Pubblica app</strong> e conferma: lo stato diventa "In produzione". Con il solo ambito drive.file non serve la verifica di Google, e i collegamenti non scadono dopo 7 giorni come in modalità test.',
       'In <strong>Client</strong> (Clients) premi <strong>Crea client</strong>, tipo di applicazione <strong>TV e dispositivi con input limitato</strong>, nome "cloudraid", Crea. Copia qui ID client e client secret (il secret si vede anche dopo, aprendo il client).',
     ],
@@ -1347,6 +1371,14 @@ document.addEventListener('click', async (ev) => {
       $('#edit-name').focus();
       return undefined;
     }
+    case 'health-open': {
+      const s = state.status;
+      if (!s || !s.snapshot) return undefined;
+      renderHealthDialog(statusItems(s.snapshot, s.history));
+      return $('#health-dialog').showModal();
+    }
+    case 'health-close':
+      return $('#health-dialog').close();
     case 'edit-close':
       return $('#edit-dialog').close();
     case 'remove-space': {
