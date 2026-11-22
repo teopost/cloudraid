@@ -129,9 +129,10 @@ carica anche trascinando, scarica, elimina), verifica e riparazione con l'avanza
   dove sono, perché sui servizi il nome non compare. Mount e riga di comando rileggono la configurazione quando prendono
   il lock, così scrivono sempre con i nomi dell'indice.
 
-Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@file`), su `https://<LAN_IP>/cloudraid/`
-(certificato non valido per un IP: il browser avvisa, come per la dashboard di Traefik) e, se impostato, su
-`https://<CLOUDRAID_HOST>/` (serve un nome che lo risolva: record DNS o file hosts).
+Nel compose il servizio `web` sta dietro Traefik, **solo dalla LAN** (`lan-only@file`), sulla porta **8443** (entrypoint
+`lan` di Traefik), non sulla 443: `https://<LAN_IP>:8443/` (certificato non valido per un IP: il browser avvisa, come per
+la dashboard di Traefik) e, se impostato, `https://<CLOUDRAID_HOST>:8443/` (serve un nome che lo risolva: record DNS o
+file hosts). Il router di casa inoltra solo 80 e 443, quindi la 8443 da Internet non si raggiunge.
 
 ## Cartella montata (FUSE)
 
@@ -207,7 +208,7 @@ install -d -m 700 config
 cp cloudraid.example.toml config/cloudraid.toml   # per cominciare bastano cartelle locali
 ./cloudraid init
 ./cloudraid status
-docker compose up -d web                     # interfaccia web: https://<LAN_IP>/cloudraid/
+docker compose up -d web                     # interfaccia web: https://<LAN_IP>:8443/
 ```
 
 Poi gli account cloud si aggiungono dall'interfaccia (Spazi), e le cartelle locali si possono dismettere.
